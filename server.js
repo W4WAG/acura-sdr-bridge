@@ -134,6 +134,110 @@ app.get("/api/status", (req, res) => {
 });
 
 // ------------------------------------------------------------
+// KIWI SDR REAL WEBSOCKET SESSION TEST
+// ------------------------------------------------------------
+
+app.get("/api/kiwi-ws-test", async (req, res) => {
+  const kiwiUrl = process.env.KIWI_URL;
+
+  if (!kiwiUrl) {
+    return res.status(500).json({
+      ok: false,
+      error: "KIWI_URL is not configured"
+    });
+  }
+
+  let parsed;
+
+  try {
+    parsed = new URL(kiwiUrl);
+  } catch (error) {
+    return res.status(500).json({
+      ok: false,
+      error: "Invalid KIWI_URL"
+    });
+  }
+
+  const wsProtocol = parsed.protocol === "https:" ? "wss:" : "ws:";
+  const timestamp = Math.floor(Date.now() / 1000);
+
+  const wsUrl =
+    `${wsProtocol}//${parsed.host}/${timestamp}/SND`;
+
+  let finished = false;
+
+  const finish = (statusCode, payload) => {
+    if (finished) return;
+    finished = true;
+
+    try {
+      kiwi.close();
+    } catch (_) {}
+
+    res.status(statusCode).json(payload);
+  };
+
+  const kiwi = new WebSocket(wsUrl, {
+    handshakeTimeout: 10000
+  });
+
+  const timeout = setTimeout(() => {
+    finish(504, {
+      ok: false,
+      websocket: wsUrl,
+      error: "Timed out waiting for KiwiSDR WebSocket response"
+    });
+  }, 12000);
+
+  kiwi.on("open", () => {
+    kiwi.send("SET auth t=kiwi p=");
+  });
+
+  kiwi.on("message", (data) => {
+    clearTimeout(timeout);
+
+    let tag = "";
+
+    if (Buffer.isBuffer(data) && data.length >= 3) {
+      tag = data.subarray(0, 3).toString("ascii");
+    } else {
+      tag = data.toString().substring(0, 3);
+    }
+
+    finish(200, {
+      ok: true,
+      websocketConnected: true,
+      websocket: wsUrl,
+      firstMessageTag: tag,
+      messageBytes: data.length
+    });
+  });
+
+  kiwi.on("unexpected-response", (request, response) => {
+    clearTimeout(timeout);
+
+    finish(502, {
+      ok: false,
+      websocketConnected: false,
+      websocket: wsUrl,
+      status: response.statusCode,
+      error: "KiwiSDR rejected WebSocket upgrade"
+    });
+  });
+
+  kiwi.on("error", (error) => {
+    clearTimeout(timeout);
+
+    finish(502, {
+      ok: false,
+      websocketConnected: false,
+      websocket: wsUrl,
+      error: error.message
+    });
+  });
+});
+
+// ------------------------------------------------------------
 // KIWI SDR CONNECTION TEST
 // ------------------------------------------------------------
 
