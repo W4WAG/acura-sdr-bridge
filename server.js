@@ -6,34 +6,14 @@ const app = express();
 const server = http.createServer(app);
 
 const PORT = process.env.PORT || 3000;
-
-/*
- * ACURA DX-1000 SDR BRIDGE
- * ------------------------
- * Railway-hosted bridge between:
- *
- *   acurahamradio.org
- *          ↓
- *   ACURA SDR Bridge
- *          ↓
- *   Public KiwiSDR receiver
- *
- * The Kiwi receiver address will be supplied through the
- * KIWI_URL Railway environment variable.
- */
+const KIWI_URL = process.env.KIWI_URL || "";
 
 app.use(express.json());
 
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader(
-    "Access-Control-Allow-Headers",
-    "Content-Type, Authorization"
-  );
-  res.setHeader(
-    "Access-Control-Allow-Methods",
-    "GET, POST, OPTIONS"
-  );
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
 
   if (req.method === "OPTIONS") {
     return res.sendStatus(204);
@@ -42,151 +22,173 @@ app.use((req, res, next) => {
   next();
 });
 
-/* -------------------------------------------------------
-   BASIC STATUS PAGE
-------------------------------------------------------- */
+
+/* =========================================================
+   ACURA DX-1000 BRIDGE HOME
+========================================================= */
 
 app.get("/", (req, res) => {
   res.type("html").send(`
-    <!doctype html>
-    <html>
-    <head>
-      <meta charset="utf-8">
-      <title>ACURA SDR Bridge</title>
-      <style>
-        body {
-          margin: 0;
-          background: #020b11;
-          color: #55eaff;
-          font-family: Arial, sans-serif;
-          text-align: center;
-          padding: 70px 20px;
-        }
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>ACURA DX-1000 SDR Bridge</title>
+<style>
+body{
+  margin:0;
+  background:#020b11;
+  color:#55eaff;
+  font-family:Arial,sans-serif;
+  text-align:center;
+  padding:70px 20px;
+}
+h1{
+  letter-spacing:4px;
+  text-shadow:0 0 18px #00d9ff;
+}
+.box{
+  max-width:650px;
+  margin:35px auto;
+  padding:28px;
+  border:1px solid #0d6274;
+  border-radius:14px;
+  background:#06141d;
+}
+.ok{color:#65ff91;}
+</style>
+</head>
+<body>
+<h1>ACURA DX-1000</h1>
+<h2>LIVE HF SDR BRIDGE</h2>
 
-        h1 {
-          letter-spacing: 4px;
-          text-shadow: 0 0 18px #00d9ff;
-        }
-
-        .status {
-          max-width: 650px;
-          margin: 35px auto;
-          padding: 25px;
-          border: 1px solid #0d6274;
-          border-radius: 14px;
-          background: #06141d;
-        }
-
-        .green {
-          color: #65ff91;
-        }
-      </style>
-    </head>
-
-    <body>
-
-      <h1>ACURA DX-1000</h1>
-
-      <h2>HF SDR BRIDGE</h2>
-
-      <div class="status">
-        <h3 class="green">● SERVER ONLINE</h3>
-
-        <p>
-          Atlantic Coast United Radio Association
-        </p>
-
-        <p>
-          Live KiwiSDR gateway
-        </p>
-      </div>
-
-    </body>
-    </html>
+<div class="box">
+<h3 class="ok">● SERVER ONLINE</h3>
+<p>Atlantic Coast United Radio Association</p>
+<p>Live KiwiSDR Gateway</p>
+</div>
+</body>
+</html>
   `);
 });
 
-/* -------------------------------------------------------
-   HEALTH CHECK
-------------------------------------------------------- */
+
+/* =========================================================
+   HEALTH
+========================================================= */
 
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
     service: "ACURA DX-1000 SDR Bridge",
-    kiwiConfigured: Boolean(process.env.KIWI_URL),
+    kiwiConfigured: Boolean(KIWI_URL),
     time: new Date().toISOString()
   });
 });
 
-/* -------------------------------------------------------
-   SDR INFORMATION
-------------------------------------------------------- */
+
+/* =========================================================
+   STATUS
+========================================================= */
 
 app.get("/api/status", (req, res) => {
   res.json({
     online: true,
-    receiverConfigured: Boolean(process.env.KIWI_URL),
-    receiver: process.env.KIWI_NAME || "ACURA Remote KiwiSDR",
+    kiwiConfigured: Boolean(KIWI_URL),
+    kiwiUrl: KIWI_URL || null,
     system: "ACURA DX-1000",
     mode: "RX ONLY"
   });
 });
 
-// ------------------------------------------------------------
-// KIWI SDR REAL WEBSOCKET SESSION TEST
-// ------------------------------------------------------------
 
-app.get("/api/kiwi-ws-test", async (req, res) => {
-  const kiwiUrl = process.env.KIWI_URL;
+/* =========================================================
+   BASIC KIWI HTTP TEST
+========================================================= */
 
-  if (!kiwiUrl) {
+app.get("/api/kiwi-test", async (req, res) => {
+
+  if (!KIWI_URL) {
     return res.status(500).json({
       ok: false,
-      error: "KIWI_URL is not configured"
+      error: "KIWI_URL not configured"
     });
   }
-
-  let parsed;
 
   try {
-    parsed = new URL(kiwiUrl);
+
+    const response = await fetch(KIWI_URL, {
+      signal: AbortSignal.timeout(10000)
+    });
+
+    res.json({
+      ok: true,
+      reachable: response.ok,
+      status: response.status,
+      statusText: response.statusText
+    });
+
   } catch (error) {
+
+    res.status(502).json({
+      ok: false,
+      reachable: false,
+      error: error.message
+    });
+
+  }
+});
+
+
+/* =========================================================
+   KIWI WEBSOCKET TEST
+========================================================= */
+
+app.get("/api/kiwi-ws-test", (req, res) => {
+
+  if (!KIWI_URL) {
     return res.status(500).json({
       ok: false,
-      error: "Invalid KIWI_URL"
+      error: "KIWI_URL not configured"
     });
   }
 
-  const wsProtocol = parsed.protocol === "https:" ? "wss:" : "ws:";
-  const timestamp = Math.floor(Date.now() / 1000);
+  const parsed = new URL(KIWI_URL);
+
+  const wsProtocol =
+    parsed.protocol === "https:" ? "wss:" : "ws:";
+
+  const stamp = Math.floor(Date.now() / 1000);
 
   const wsUrl =
-    `${wsProtocol}//${parsed.host}/${timestamp}/SND`;
+    `${wsProtocol}//${parsed.host}/${stamp}/SND`;
 
   let finished = false;
 
-  const finish = (statusCode, payload) => {
+  const kiwi = new WebSocket(wsUrl, {
+    handshakeTimeout: 10000
+  });
+
+  const finish = (code, data) => {
+
     if (finished) return;
+
     finished = true;
 
     try {
       kiwi.close();
     } catch (_) {}
 
-    res.status(statusCode).json(payload);
+    res.status(code).json(data);
   };
 
-  const kiwi = new WebSocket(wsUrl, {
-    handshakeTimeout: 10000
-  });
+  const timer = setTimeout(() => {
 
-  const timeout = setTimeout(() => {
     finish(504, {
       ok: false,
-      websocket: wsUrl,
-      error: "Timed out waiting for KiwiSDR WebSocket response"
+      error: "Kiwi WebSocket timeout"
     });
+
   }, 12000);
 
   kiwi.on("open", () => {
@@ -194,199 +196,387 @@ app.get("/api/kiwi-ws-test", async (req, res) => {
   });
 
   kiwi.on("message", (data) => {
-    clearTimeout(timeout);
 
-    let tag = "";
+    clearTimeout(timer);
 
-    if (Buffer.isBuffer(data) && data.length >= 3) {
-      tag = data.subarray(0, 3).toString("ascii");
-    } else {
-      tag = data.toString().substring(0, 3);
-    }
+    const packet = Buffer.from(data);
 
     finish(200, {
       ok: true,
       websocketConnected: true,
-      websocket: wsUrl,
-      firstMessageTag: tag,
-      messageBytes: data.length
+      firstMessageTag:
+        packet.subarray(0, 3).toString("ascii"),
+      messageBytes: packet.length
     });
-  });
 
-  kiwi.on("unexpected-response", (request, response) => {
-    clearTimeout(timeout);
-
-    finish(502, {
-      ok: false,
-      websocketConnected: false,
-      websocket: wsUrl,
-      status: response.statusCode,
-      error: "KiwiSDR rejected WebSocket upgrade"
-    });
   });
 
   kiwi.on("error", (error) => {
-    clearTimeout(timeout);
+
+    clearTimeout(timer);
 
     finish(502, {
       ok: false,
       websocketConnected: false,
-      websocket: wsUrl,
       error: error.message
     });
+
   });
+
 });
 
-// ------------------------------------------------------------
-// KIWI SDR CONNECTION TEST
-// ------------------------------------------------------------
 
-app.get("/api/kiwi-test", async (req, res) => {
-  const kiwiUrl = process.env.KIWI_URL;
+/* =========================================================
+   RECEIVER HELPERS
+========================================================= */
 
-  if (!kiwiUrl) {
-    return res.status(500).json({
-      ok: false,
-      error: "KIWI_URL is not configured"
-    });
+const filters = {
+
+  usb: [300, 2700],
+  lsb: [-2700, -300],
+  am: [-4900, 4900],
+  cw: [300, 700]
+
+};
+
+
+function normalizeMode(mode) {
+
+  mode =
+    String(mode || "usb").toLowerCase();
+
+  return filters[mode] ? mode : "usb";
+}
+
+
+function normalizeFrequency(value) {
+
+  let f = Number(value);
+
+  if (!Number.isFinite(f)) {
+    return 14250;
   }
 
-  try {
-    const response = await fetch(kiwiUrl, {
-      method: "GET",
-      signal: AbortSignal.timeout(10000)
-    });
-
-    res.json({
-      ok: true,
-      kiwiUrl: kiwiUrl,
-      reachable: response.ok,
-      status: response.status,
-      statusText: response.statusText
-    });
-
-  } catch (error) {
-    res.status(502).json({
-      ok: false,
-      kiwiUrl: kiwiUrl,
-      reachable: false,
-      error: error.message
-    });
+  /* Hz -> kHz */
+  if (f > 100000) {
+    f /= 1000;
   }
-});
 
-/* -------------------------------------------------------
-   WEBSOCKET SERVER
+  return Math.min(
+    30000,
+    Math.max(10, f)
+  );
+}
 
-   The WordPress SDR will connect here.
 
-   This first bridge layer accepts frequency/mode commands
-   from the ACURA radio. The Kiwi-specific session layer
-   will be attached next after Railway deployment is verified.
-------------------------------------------------------- */
+function makeTuneCommand(frequency, mode) {
+
+  const m = normalizeMode(mode);
+  const f = normalizeFrequency(frequency);
+  const [low, high] = filters[m];
+
+  return (
+    `SET mod=${m}` +
+    ` low_cut=${low}` +
+    ` high_cut=${high}` +
+    ` freq=${f.toFixed(3)}`
+  );
+}
+
+
+/* =========================================================
+   LIVE ACURA SDR SOCKET
+
+   WordPress will connect to:
+
+   wss://acura-sdr-bridge-production.up.railway.app/sdr
+========================================================= */
 
 const wss = new WebSocket.Server({
   server,
   path: "/sdr"
 });
 
-wss.on("connection", (socket) => {
 
-  console.log("ACURA SDR client connected");
+wss.on("connection", (browser) => {
 
-  socket.send(JSON.stringify({
-    type: "status",
-    connected: true,
-    bridge: "ACURA DX-1000",
-    receiverConfigured: Boolean(process.env.KIWI_URL)
+  console.log("ACURA SDR visitor connected");
+
+  if (!KIWI_URL) {
+
+    browser.send(JSON.stringify({
+      type: "error",
+      message: "KIWI_URL not configured"
+    }));
+
+    return browser.close();
+  }
+
+
+  const parsed = new URL(KIWI_URL);
+
+  const wsProtocol =
+    parsed.protocol === "https:" ? "wss:" : "ws:";
+
+  const stamp = Math.floor(Date.now() / 1000);
+
+  const kiwiWsUrl =
+    `${wsProtocol}//${parsed.host}/${stamp}/SND`;
+
+
+  let frequency = 14250;
+  let mode = "usb";
+  let configured = false;
+  let keepalive = null;
+
+
+  browser.send(JSON.stringify({
+    type: "bridge",
+    status: "connecting",
+    receiver: parsed.host
   }));
 
-  socket.on("message", (data) => {
 
-    try {
+  const kiwi = new WebSocket(kiwiWsUrl, {
+    handshakeTimeout: 10000
+  });
 
-      const message = JSON.parse(data.toString());
 
-      console.log("SDR COMMAND:", message);
+  function sendKiwi(command) {
 
-      /*
-       * Expected commands from our ACURA front panel:
-       *
-       * {
-       *   type: "tune",
-       *   frequency: 14250000,
-       *   mode: "usb"
-       * }
-       *
-       * or
-       *
-       * {
-       *   type: "mode",
-       *   mode: "lsb"
-       * }
-       */
+    if (kiwi.readyState === WebSocket.OPEN) {
+      kiwi.send(command);
+    }
+  }
 
-      if (message.type === "tune") {
 
-        const frequency = Number(message.frequency);
+  function configureKiwi() {
 
-        if (
-          !Number.isFinite(frequency) ||
-          frequency < 10000 ||
-          frequency > 30000000
-        ) {
-          socket.send(JSON.stringify({
-            type: "error",
-            message: "Frequency outside KiwiSDR HF range"
-          }));
+    if (configured) return;
 
-          return;
-        }
+    configured = true;
 
-        socket.send(JSON.stringify({
-          type: "tuned",
-          frequency,
-          mode: message.mode || "usb"
+    sendKiwi("SET ident_user=ACURA-DX");
+
+    sendKiwi(
+      makeTuneCommand(frequency, mode)
+    );
+
+    sendKiwi(
+      "SET agc=1 hang=0 thresh=-100 slope=6 decay=1000 manGain=50"
+    );
+
+    sendKiwi("SET compression=0");
+
+    sendKiwi("SET squelch=0 max=0");
+
+    sendKiwi("SET keepalive");
+
+    keepalive = setInterval(() => {
+      sendKiwi("SET keepalive");
+    }, 5000);
+
+
+    browser.send(JSON.stringify({
+      type: "receiver",
+      status: "live",
+      frequency,
+      mode
+    }));
+  }
+
+
+  kiwi.on("open", () => {
+
+    console.log("Kiwi SND socket connected");
+
+    sendKiwi("SET auth t=kiwi p=");
+
+    browser.send(JSON.stringify({
+      type: "kiwi",
+      status: "connected"
+    }));
+  });
+
+
+  kiwi.on("message", (data) => {
+
+    const packet = Buffer.from(data);
+
+    if (packet.length < 3) return;
+
+    const tag =
+      packet.subarray(0, 3).toString("ascii");
+
+
+    /* Kiwi setup messages */
+
+    if (tag === "MSG") {
+
+      const text =
+        packet.subarray(4).toString("utf8");
+
+
+      if (
+        text.includes("sample_rate=") ||
+        text.includes("audio_rate=")
+      ) {
+
+        configureKiwi();
+      }
+
+
+      if (browser.readyState === WebSocket.OPEN) {
+
+        browser.send(JSON.stringify({
+          type: "kiwi-msg",
+          value: text
         }));
       }
 
-    } catch (error) {
+      return;
+    }
 
-      console.error("Invalid SDR message:", error);
 
-      socket.send(JSON.stringify({
+    /* Real Kiwi received audio packet */
+
+    if (tag === "SND") {
+
+      if (browser.readyState === WebSocket.OPEN) {
+
+        browser.send(packet, {
+          binary: true
+        });
+      }
+
+      return;
+    }
+
+  });
+
+
+  /* Commands from ACURA radio */
+
+  browser.on("message", (data, isBinary) => {
+
+    if (isBinary) return;
+
+    let message;
+
+    try {
+      message =
+        JSON.parse(data.toString());
+    } catch (_) {
+      return;
+    }
+
+
+    if (message.type === "tune") {
+
+      frequency =
+        normalizeFrequency(message.frequency);
+
+      mode =
+        normalizeMode(message.mode || mode);
+
+      sendKiwi(
+        makeTuneCommand(frequency, mode)
+      );
+
+
+      browser.send(JSON.stringify({
+        type: "tuned",
+        frequency,
+        mode
+      }));
+    }
+
+
+    if (message.type === "mode") {
+
+      mode =
+        normalizeMode(message.mode);
+
+      sendKiwi(
+        makeTuneCommand(frequency, mode)
+      );
+    }
+
+  });
+
+
+  kiwi.on("error", (error) => {
+
+    console.error(
+      "Kiwi error:",
+      error.message
+    );
+
+    if (browser.readyState === WebSocket.OPEN) {
+
+      browser.send(JSON.stringify({
         type: "error",
-        message: "Invalid SDR command"
+        message: error.message
       }));
     }
 
   });
 
-  socket.on("close", () => {
-    console.log("ACURA SDR client disconnected");
+
+  kiwi.on("close", () => {
+
+    console.log("Kiwi disconnected");
+
+    if (keepalive) {
+      clearInterval(keepalive);
+    }
+
+    if (browser.readyState === WebSocket.OPEN) {
+
+      browser.send(JSON.stringify({
+        type: "kiwi",
+        status: "disconnected"
+      }));
+    }
+
+  });
+
+
+  browser.on("close", () => {
+
+    console.log("ACURA visitor disconnected");
+
+    if (keepalive) {
+      clearInterval(keepalive);
+    }
+
+    try {
+      kiwi.close();
+    } catch (_) {}
+
   });
 
 });
 
-/* -------------------------------------------------------
-   START SERVER
-------------------------------------------------------- */
 
-server.listen(PORT, "0.0.0.0", () => {
+/* =========================================================
+   START
+========================================================= */
 
-  console.log("");
-  console.log("-----------------------------------------");
-  console.log(" ACURA DX-1000 SDR BRIDGE");
-  console.log("-----------------------------------------");
-  console.log(` Server listening on port ${PORT}`);
+server.listen(
+  PORT,
+  "0.0.0.0",
+  () => {
 
-  if (process.env.KIWI_URL) {
-    console.log(` Kiwi receiver: ${process.env.KIWI_URL}`);
-  } else {
-    console.log(" Kiwi receiver: NOT CONFIGURED YET");
+    console.log("");
+    console.log("===============================");
+    console.log(" ACURA DX-1000 SDR BRIDGE");
+    console.log("===============================");
+    console.log(`Port: ${PORT}`);
+    console.log(`Kiwi: ${KIWI_URL || "NOT SET"}`);
+    console.log("Live browser socket: /sdr");
+    console.log("===============================");
+    console.log("");
+
   }
-
-  console.log("-----------------------------------------");
-  console.log("");
-
-});
+);
