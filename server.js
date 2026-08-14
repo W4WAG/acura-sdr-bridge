@@ -355,7 +355,7 @@ wss.on("connection", (browser) => {
     if (configured) return;
 
     configured = true;
-
+sendKiwi("SET AR OK in=12000 out=44100");
     sendKiwi("SET ident_user=ACURA-DX");
 
     sendKiwi(
