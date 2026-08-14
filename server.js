@@ -133,6 +133,44 @@ app.get("/api/status", (req, res) => {
   });
 });
 
+// ------------------------------------------------------------
+// KIWI SDR CONNECTION TEST
+// ------------------------------------------------------------
+
+app.get("/api/kiwi-test", async (req, res) => {
+  const kiwiUrl = process.env.KIWI_URL;
+
+  if (!kiwiUrl) {
+    return res.status(500).json({
+      ok: false,
+      error: "KIWI_URL is not configured"
+    });
+  }
+
+  try {
+    const response = await fetch(kiwiUrl, {
+      method: "GET",
+      signal: AbortSignal.timeout(10000)
+    });
+
+    res.json({
+      ok: true,
+      kiwiUrl: kiwiUrl,
+      reachable: response.ok,
+      status: response.status,
+      statusText: response.statusText
+    });
+
+  } catch (error) {
+    res.status(502).json({
+      ok: false,
+      kiwiUrl: kiwiUrl,
+      reachable: false,
+      error: error.message
+    });
+  }
+});
+
 /* -------------------------------------------------------
    WEBSOCKET SERVER
 
