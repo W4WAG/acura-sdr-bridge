@@ -321,7 +321,7 @@ wss.on("connection", (browser) => {
   const stamp = Math.floor(Date.now() / 1000);
 
   const kiwiWsUrl =
-  `${wsProtocol}//${parsed.host}/kiwi/${stamp}/SND`;
+  `${wsProtocol}//${parsed.host}/${stamp}/SND`;
 
 
   let frequency = 14250;
