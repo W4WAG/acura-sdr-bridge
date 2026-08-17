@@ -386,16 +386,22 @@ sendKiwi("SET AR OK in=12000 out=44100");
   }
 
 
-  kiwi.on("open", () => {
+kiwi.on("open", () => {
 
-    console.log("Kiwi SND socket connected");
+  console.log("Kiwi SND socket connected");
 
-    sendKiwi("SET auth t=kiwi p=");
+  sendKiwi("SET auth t=kiwi p=");
 
-    browser.send(JSON.stringify({
-      type: "kiwi",
-      status: "connected"
-    }));
+  setTimeout(() => {
+    console.log("Starting Kiwi audio configuration");
+    configureKiwi();
+  }, 500);
+
+  browser.send(JSON.stringify({
+    type: "kiwi",
+    status: "connected"
+  }));
+});
   });
 
 
