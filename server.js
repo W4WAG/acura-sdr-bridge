@@ -11,211 +11,86 @@ const server = http.createServer(app);
 
 const PORT = Number(process.env.PORT || 8080);
 
-const UPSTREAM_BASE =
-  process.env.UPSTREAM_BASE ||
-  process.env.UBERSDR_BASE ||
-  process.env.UPSTREAM_URL ||
+const UBERSDR_BASE =
   process.env.UBERSDR_URL ||
+  process.env.UPSTREAM_URL ||
   "https://ubersdr.k3fef.com";
 
-const UPSTREAM_PASSWORD =
+const PASSWORD =
   process.env.UPSTREAM_PASSWORD ||
   process.env.UBERSDR_PASSWORD ||
   "";
 
-const ADMIN_SUFFIX =
-  process.env.ADMIN_SUFFIX ||
-  process.env.UBERSDR_ADMIN_SUFFIX ||
-  "";
+const CLIENT = "ACURA-AUDIO-TEST/1.0";
 
-const CLIENT_NAME = "VibeSDR/10 (+https://vibesdr.net)";
-
-const DEFAULT_FREQ = 7255000;
-const DEFAULT_MODE = "lsb";
-
-/*
- * ACURA'S EXISTING WEBPAGE EXPECTS:
- *
- * bytes 0..7  = miscellaneous/header
- * bytes 8..9  = RSSI, unsigned BE, interpreted:
- *
- *               rssi = raw * 0.1 - 127
- *
- * bytes 10+   = SIGNED PCM16 BIG-ENDIAN
- *
- * Therefore this bridge converts:
- *
- * UberSDR V2
- * 21-byte header + OPUS
- *
- *              ↓
- *
- * decoded PCM16
- *
- *              ↓
- *
- * ACURA's existing 10-byte packet format
- *
- * NO WordPress audio decoder change required.
- */
-
-
-/* ============================================================
-   LOGGING
-   ============================================================ */
+const FREQUENCY = 7255000;
+const MODE = "lsb";
 
 function log(...args) {
-  console.log(
-    new Date().toISOString(),
-    ...args
-  );
+  console.log(new Date().toISOString(), ...args);
 }
 
-
-/* ============================================================
-   HELPERS
-   ============================================================ */
-
-function makeUuid() {
-  if (typeof crypto.randomUUID === "function") {
-    return crypto.randomUUID();
-  }
-
-  return crypto
-    .randomBytes(16)
-    .toString("hex");
+function uuid() {
+  return crypto.randomUUID
+    ? crypto.randomUUID()
+    : crypto.randomBytes(16).toString("hex");
 }
-
-
-function normalizeFrequency(value) {
-  let f = Number(value);
-
-  if (!Number.isFinite(f) || f <= 0) {
-    return DEFAULT_FREQ;
-  }
-
-  if (f < 1000) {
-    f *= 1000000;
-  } else if (f < 1000000) {
-    f *= 1000;
-  }
-
-  return Math.round(f);
-}
-
-
-function normalizeMode(value) {
-  let mode =
-    String(value || DEFAULT_MODE)
-      .toLowerCase();
-
-  if (mode === "cw") {
-    mode = "cwu";
-  }
-
-  const allowed = new Set([
-    "usb",
-    "lsb",
-    "am",
-    "sam",
-    "fm",
-    "nfm",
-    "cwu",
-    "cwl"
-  ]);
-
-  return allowed.has(mode)
-    ? mode
-    : DEFAULT_MODE;
-}
-
 
 function httpBase() {
-  let base =
-    String(UPSTREAM_BASE || "")
-      .trim();
-
-  base =
-    base.replace(/^ws:/i, "http:");
-
-  base =
-    base.replace(/^wss:/i, "https:");
-
-  return base.replace(/\/+$/, "");
+  return UBERSDR_BASE
+    .replace(/^wss:/i, "https:")
+    .replace(/^ws:/i, "http:")
+    .replace(/\/+$/, "");
 }
-
 
 function wsBase() {
-  const base = httpBase();
-
-  if (base.startsWith("https://")) {
-    return "wss://" + base.slice(8);
-  }
-
-  if (base.startsWith("http://")) {
-    return "ws://" + base.slice(7);
-  }
-
-  return "wss://" + base;
-}
-
-
-function adminQuery() {
-  if (!ADMIN_SUFFIX) {
-    return "";
-  }
-
-  return ADMIN_SUFFIX.startsWith("&")
-    ? ADMIN_SUFFIX
-    : "&" + ADMIN_SUFFIX;
+  return httpBase()
+    .replace(/^https:/i, "wss:")
+    .replace(/^http:/i, "ws:");
 }
 
 
 /* ============================================================
-   SESSION REGISTRATION
+   UBERSDR SESSION REGISTRATION
    ============================================================ */
 
-async function registerSession(uuid) {
+async function registerSession(sessionId) {
+
   const url =
     `${httpBase()}/connection?user_session_id=` +
-    encodeURIComponent(uuid) +
-    adminQuery();
-
-  log("REGISTERING UBERSDR SESSION");
-  log("POST /connection uuid=" + uuid);
+    encodeURIComponent(sessionId);
 
   const body = {
-    user_session_id: uuid
+    user_session_id: sessionId
   };
 
-  if (UPSTREAM_PASSWORD) {
-    body.password = UPSTREAM_PASSWORD;
+  if (PASSWORD) {
+    body.password = PASSWORD;
   }
 
-  const response =
-    await fetch(url, {
-      method: "POST",
+  log("POST /connection");
 
-      headers: {
-        "Content-Type": "application/json",
-        "User-Agent": CLIENT_NAME,
-        "X-Requested-With": "VibeSDR"
-      },
+  const response = await fetch(url, {
+    method: "POST",
 
-      body: JSON.stringify(body)
-    });
+    headers: {
+      "Content-Type": "application/json",
+      "User-Agent": CLIENT,
+      "X-Requested-With": "VibeSDR"
+    },
 
-  const text =
-    await response.text();
+    body: JSON.stringify(body)
+  });
+
+  const text = await response.text();
 
   if (!response.ok) {
     throw new Error(
-      `POST /connection HTTP ${response.status}: ` +
-      text.slice(0, 300)
+      `Registration HTTP ${response.status}: ${text}`
     );
   }
 
-  let result = {};
+  let result;
 
   try {
     result = JSON.parse(text);
@@ -223,19 +98,13 @@ async function registerSession(uuid) {
     result = { allowed: true };
   }
 
-  log(
-    "CONNECTION RESPONSE:",
-    JSON.stringify(result).slice(0, 800)
-  );
+  log("Registration:", result);
 
   if (result.allowed === false) {
     throw new Error(
-      "UberSDR refused session: " +
-      (result.reason || "unknown reason")
+      result.reason || "Receiver refused connection"
     );
   }
-
-  return result;
 }
 
 
@@ -243,210 +112,355 @@ async function registerSession(uuid) {
    UBERSDR AUDIO URL
    ============================================================ */
 
-function buildAudioUrl(uuid, frequency, mode) {
-  const params =
-    new URLSearchParams();
+function audioUrl(sessionId) {
 
-  params.set(
-    "user_session_id",
-    uuid
-  );
+  const params = new URLSearchParams();
 
-  params.set(
-    "frequency",
-    String(frequency)
-  );
+  params.set("user_session_id", sessionId);
+  params.set("frequency", String(FREQUENCY));
+  params.set("mode", MODE);
+  params.set("format", "opus");
+  params.set("version", "2");
+  params.set("client", CLIENT);
 
-  params.set(
-    "mode",
-    mode
-  );
-
-  params.set(
-    "format",
-    "opus"
-  );
-
-  params.set(
-    "version",
-    "2"
-  );
-
-  params.set(
-    "client",
-    CLIENT_NAME
-  );
-
-  if (UPSTREAM_PASSWORD) {
-    params.set(
-      "password",
-      UPSTREAM_PASSWORD
-    );
+  if (PASSWORD) {
+    params.set("password", PASSWORD);
   }
 
-  let url =
-    `${wsBase()}/ws?${params.toString()}`;
-
-  if (ADMIN_SUFFIX) {
-    url += adminQuery();
-  }
-
-  return url;
+  return `${wsBase()}/ws?${params.toString()}`;
 }
 
 
 /* ============================================================
-   SIGNAL CONVERSION
+   BARE TEST PAGE
    ============================================================ */
 
-function powerToDbm(basebandPower) {
-  let p = Number(basebandPower);
+app.get("/test", (req, res) => {
 
-  /*
-   * UberSDR's baseband power may already resemble
-   * a negative dB value.
-   */
+  res.type("html").send(`<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ACURA SDR Audio Test</title>
 
-  if (
-    Number.isFinite(p) &&
-    p <= 0 &&
-    p >= -160
-  ) {
-    return p;
-  }
+<style>
+body {
+  background:#070b0e;
+  color:#eee;
+  font-family:Arial,sans-serif;
+  text-align:center;
+  padding:60px 20px;
+}
 
-  /*
-   * If supplied as linear power, convert to dB.
-   */
+h1 {
+  font-size:28px;
+}
 
-  if (
-    Number.isFinite(p) &&
-    p > 0
-  ) {
-    const db =
-      10 * Math.log10(p);
+#status {
+  margin:25px;
+  font:700 18px monospace;
+}
 
-    if (Number.isFinite(db)) {
-      return Math.max(
-        -127,
-        Math.min(-10, db)
+button {
+  padding:18px 34px;
+  font-size:20px;
+  font-weight:700;
+  cursor:pointer;
+}
+
+.good { color:#46e878; }
+.bad  { color:#ff6262; }
+</style>
+</head>
+
+<body>
+
+<h1>ACURA SDR — AUDIO ONLY TEST</h1>
+
+<p>
+K3FEF • 7.255 MHz • LSB
+</p>
+
+<button id="play">▶ PLAY LIVE AUDIO</button>
+
+<div id="status">READY</div>
+
+<script>
+(() => {
+
+  const button = document.getElementById("play");
+  const status = document.getElementById("status");
+
+  let ws = null;
+  let ctx = null;
+  let gain = null;
+  let playAt = 0;
+
+  async function startAudio() {
+
+    if (!ctx) {
+
+      ctx = new (
+        window.AudioContext ||
+        window.webkitAudioContext
+      )();
+
+      gain = ctx.createGain();
+
+      gain.gain.value = 1.0;
+
+      gain.connect(
+        ctx.destination
       );
     }
+
+    if (ctx.state === "suspended") {
+      await ctx.resume();
+    }
+
+    playAt =
+      ctx.currentTime + 0.15;
   }
 
-  /*
-   * Safe receiver-floor fallback.
-   */
 
-  return -100;
-}
+  function playPCM(arrayBuffer) {
 
+    const bytes =
+      new Uint8Array(arrayBuffer);
 
-function rssiToRaw(rssi) {
-  /*
-   * Existing WordPress equation:
-   *
-   * currentRSSI =
-   *     raw * 0.1 - 127
-   *
-   * Reverse it here.
-   */
+    /*
+     * Test bridge packet:
+     *
+     * 0-3  = PCM1
+     * 4-7  = sample rate UInt32 LE
+     * 8+   = PCM16 LE mono
+     */
 
-  let raw =
-    Math.round(
-      (rssi + 127) * 10
-    );
+    if (bytes.length < 10) return;
 
-  raw =
-    Math.max(
-      0,
-      Math.min(65535, raw)
-    );
+    if (
+      bytes[0] !== 80 ||
+      bytes[1] !== 67 ||
+      bytes[2] !== 77 ||
+      bytes[3] !== 49
+    ) return;
 
-  return raw;
-}
+    const view =
+      new DataView(arrayBuffer);
 
+    const sampleRate =
+      view.getUint32(4, true);
 
-/* ============================================================
-   PCM CONVERSION FOR EXISTING ACURA WEBPAGE
-   ============================================================ */
-
-function makeAcuraPacket(
-  pcmLE,
-  rssi
-) {
-  /*
-   * Existing webpage expects:
-   *
-   * 10-byte header
-   * followed by PCM16 BIG-ENDIAN.
-   */
-
-  const samples =
-    Math.floor(
-      pcmLE.length / 2
-    );
-
-  const packet =
-    Buffer.allocUnsafe(
-      10 + samples * 2
-    );
-
-  /*
-   * Header.
-   */
-
-  packet.fill(
-    0,
-    0,
-    10
-  );
-
-  /*
-   * Put RSSI where current WordPress code
-   * already expects it: bytes 8-9.
-   */
-
-  const raw =
-    rssiToRaw(rssi);
-
-  packet.writeUInt16BE(
-    raw,
-    8
-  );
-
-  /*
-   * opusscript produces PCM16 LE.
-   *
-   * Current ACURA browser decoder reads
-   * PCM16 BIG-ENDIAN, therefore swap bytes.
-   */
-
-  for (
-    let i = 0;
-    i < samples;
-    i++
-  ) {
-    const sample =
-      pcmLE.readInt16LE(
-        i * 2
+    const sampleCount =
+      Math.floor(
+        (bytes.length - 8) / 2
       );
 
-    packet.writeInt16BE(
-      sample,
-      10 + i * 2
-    );
+    if (!sampleCount) return;
+
+    const audioBuffer =
+      ctx.createBuffer(
+        1,
+        sampleCount,
+        sampleRate
+      );
+
+    const channel =
+      audioBuffer.getChannelData(0);
+
+    let offset = 8;
+
+    for (
+      let i = 0;
+      i < sampleCount;
+      i++, offset += 2
+    ) {
+
+      channel[i] =
+        view.getInt16(
+          offset,
+          true
+        ) / 32768;
+    }
+
+    const source =
+      ctx.createBufferSource();
+
+    source.buffer =
+      audioBuffer;
+
+    source.connect(gain);
+
+    const now =
+      ctx.currentTime;
+
+    if (
+      playAt <
+      now + 0.05
+    ) {
+      playAt =
+        now + 0.05;
+    }
+
+    source.start(playAt);
+
+    playAt +=
+      sampleCount /
+      sampleRate;
   }
 
-  return packet;
-}
+
+  button.onclick =
+    async () => {
+
+      if (
+        ws &&
+        ws.readyState === WebSocket.OPEN
+      ) {
+
+        ws.close();
+
+        return;
+      }
+
+      await startAudio();
+
+      status.textContent =
+        "CONNECTING...";
+
+      status.className = "";
+
+      button.textContent =
+        "CONNECTING...";
+
+
+      const protocol =
+        location.protocol === "https:"
+          ? "wss:"
+          : "ws:";
+
+      ws =
+        new WebSocket(
+          protocol +
+          "//" +
+          location.host +
+          "/test-audio"
+        );
+
+      ws.binaryType =
+        "arraybuffer";
+
+
+      ws.onopen = () => {
+
+        status.textContent =
+          "CONNECTED — WAITING FOR AUDIO";
+
+        status.className =
+          "good";
+
+        button.textContent =
+          "■ STOP LIVE AUDIO";
+      };
+
+
+      ws.onmessage =
+        event => {
+
+          if (
+            typeof event.data === "string"
+          ) {
+
+            try {
+
+              const msg =
+                JSON.parse(event.data);
+
+              if (msg.type === "audio") {
+
+                status.textContent =
+                  "LIVE AUDIO • " +
+                  msg.rate +
+                  " Hz";
+
+              }
+
+              if (msg.type === "error") {
+
+                status.textContent =
+                  msg.message;
+
+                status.className =
+                  "bad";
+              }
+
+            } catch {}
+
+            return;
+          }
+
+          playPCM(
+            event.data
+          );
+        };
+
+
+      ws.onerror = () => {
+
+        status.textContent =
+          "WEBSOCKET ERROR";
+
+        status.className =
+          "bad";
+      };
+
+
+      ws.onclose = () => {
+
+        status.textContent =
+          "DISCONNECTED";
+
+        status.className = "";
+
+        button.textContent =
+          "▶ PLAY LIVE AUDIO";
+
+        ws = null;
+      };
+
+    };
+
+})();
+</script>
+
+</body>
+</html>`);
+});
+
+
+app.get("/", (req, res) => {
+
+  res.type("text/plain").send(
+`ACURA SDR AUDIO TEST
+STATUS: ONLINE
+
+TEST PAGE:
+/test
+
+FREQUENCY:
+7.255 MHz LSB
+`
+  );
+
+});
 
 
 /* ============================================================
-   BROWSER WEBSOCKET
+   TEST AUDIO WEBSOCKET
    ============================================================ */
 
-const browserWss =
+const testWss =
   new WebSocket.Server({
     noServer: true,
     perMessageDeflate: false
@@ -457,38 +471,41 @@ server.on(
   "upgrade",
   (req, socket, head) => {
 
-    let pathname;
+    let path;
 
     try {
-      pathname =
+
+      path =
         new URL(
           req.url,
-          `http://${req.headers.host || "localhost"}`
+          "http://localhost"
         ).pathname;
-    }
 
-    catch {
+    } catch {
+
       socket.destroy();
+
       return;
     }
 
 
-    if (pathname !== "/sdr") {
+    if (path !== "/test-audio") {
+
       socket.destroy();
+
       return;
     }
 
 
-    browserWss.handleUpgrade(
+    testWss.handleUpgrade(
       req,
       socket,
       head,
       ws => {
 
-        browserWss.emit(
+        testWss.emit(
           "connection",
-          ws,
-          req
+          ws
         );
 
       }
@@ -499,1073 +516,466 @@ server.on(
 
 
 /* ============================================================
-   ACURA CLIENT
+   ONE LISTENER = ONE UBERSDR SESSION
    ============================================================ */
 
-browserWss.on(
+testWss.on(
   "connection",
-  browser => {
+  async browser => {
 
     log(
-      "ACURA SDR visitor connected"
+      "TEST BROWSER CONNECTED"
     );
 
+    const sessionId =
+      uuid();
 
     let upstream = null;
 
-    let closed = false;
-
-    let connecting = false;
-
-    let reconnectTimer = null;
-
-    let frequency =
-      DEFAULT_FREQ;
-
-    let mode =
-      DEFAULT_MODE;
-
-    const uuid =
-      makeUuid();
-
-
-    /*
-     * Decoder gets created after first packet because
-     * V2 header tells us the actual sample rate/channels.
-     */
-
-    let opusDecoder = null;
+    let decoder = null;
 
     let decoderRate = 0;
 
     let decoderChannels = 0;
 
-    let packetCount = 0;
-
-    let lastRssi = -100;
+    let firstAudio = true;
 
 
-    function sendBrowser(obj) {
+    function sendJSON(obj) {
+
       if (
-        browser.readyState !==
+        browser.readyState ===
         WebSocket.OPEN
       ) {
-        return;
-      }
 
-      try {
         browser.send(
           JSON.stringify(obj)
         );
       }
 
-      catch {}
     }
 
 
-    /* ========================================================
-       OPUS DECODER
-       ======================================================== */
+    function destroy() {
 
-    function ensureDecoder(
-      sampleRate,
-      channels
-    ) {
+      if (upstream) {
 
-      if (
-        opusDecoder &&
-        decoderRate === sampleRate &&
-        decoderChannels === channels
-      ) {
-        return;
-      }
-
-
-      if (opusDecoder) {
         try {
-          opusDecoder.delete();
+          upstream.close();
         } catch {}
 
-        opusDecoder = null;
+        upstream = null;
       }
 
 
-      log(
-        "CREATING OPUS DECODER:",
-        sampleRate,
-        "Hz",
-        channels,
-        "channel(s)"
-      );
+      if (decoder) {
 
+        try {
+          decoder.delete();
+        } catch {}
 
-      opusDecoder =
-        new OpusScript(
-          sampleRate,
-          channels,
-          OpusScript.Application.AUDIO
-        );
-
-
-      decoderRate =
-        sampleRate;
-
-      decoderChannels =
-        channels;
-    }
-
-
-    /* ========================================================
-       LIVE TUNING
-       ======================================================== */
-
-    function sendTune() {
-      if (
-        !upstream ||
-        upstream.readyState !==
-        WebSocket.OPEN
-      ) {
-
-        log(
-          "Tune queued until upstream is ready"
-        );
-
-        connectUpstream();
-
-        return;
-      }
-
-
-      const command = {
-        type: "tune",
-        frequency,
-        mode
-      };
-
-
-      try {
-        upstream.send(
-          JSON.stringify(command)
-        );
-
-        log(
-          "LIVE TUNE SENT ->",
-          frequency,
-          "Hz",
-          mode
-        );
-      }
-
-      catch (err) {
-
-        log(
-          "TUNE SEND ERROR:",
-          err.message
-        );
-
+        decoder = null;
       }
     }
 
 
-    /* ========================================================
-       RECONNECT
-       ======================================================== */
+    try {
 
-    function scheduleReconnect() {
-      if (
-        closed ||
-        reconnectTimer
-      ) {
-        return;
-      }
+      await registerSession(
+        sessionId
+      );
 
+    } catch (err) {
 
-      reconnectTimer =
-        setTimeout(
-          () => {
+      log(
+        "REGISTRATION FAILED:",
+        err.message
+      );
 
-            reconnectTimer =
-              null;
+      sendJSON({
+        type: "error",
+        message:
+          "Registration failed: " +
+          err.message
+      });
 
-            if (!closed) {
-              connectUpstream();
-            }
-
-          },
-          2000
-        );
+      return;
     }
 
 
-    /* ========================================================
-       CONNECT UBERSDR
-       ======================================================== */
-
-    async function connectUpstream() {
-
-      if (
-        closed ||
-        connecting
-      ) {
-        return;
-      }
+    if (
+      browser.readyState !==
+      WebSocket.OPEN
+    ) {
+      return;
+    }
 
 
-      if (
-        upstream &&
-        (
-          upstream.readyState ===
-            WebSocket.OPEN ||
-
-          upstream.readyState ===
-            WebSocket.CONNECTING
-        )
-      ) {
-        return;
-      }
+    const url =
+      audioUrl(sessionId);
 
 
-      connecting = true;
+    log(
+      "OPENING UBERSDR AUDIO"
+    );
 
 
-      log(
-        "================================"
-      );
+    upstream =
+      new WebSocket(
+        url,
+        {
+          handshakeTimeout: 15000,
+          perMessageDeflate: false,
 
-      log(
-        "STARTING UBERSDR CONNECTION"
-      );
-
-      log(
-        "Frequency:",
-        frequency,
-        "Hz"
-      );
-
-      log(
-        "Mode:",
-        mode
-      );
-
-      log(
-        "UUID:",
-        uuid
-      );
-
-      log(
-        "================================"
-      );
-
-
-      /*
-       * STEP 1:
-       * REGISTER SESSION.
-       */
-
-      try {
-
-        await registerSession(
-          uuid
-        );
-
-
-        log(
-          "UBERSDR SESSION REGISTERED"
-        );
-
-      }
-
-      catch (err) {
-
-        connecting = false;
-
-
-        log(
-          "SESSION REGISTRATION FAILED:",
-          err.message
-        );
-
-
-        sendBrowser({
-          type: "error",
-          stage: "registration",
-          message: err.message
-        });
-
-
-        scheduleReconnect();
-
-        return;
-      }
-
-
-      if (closed) {
-        connecting = false;
-        return;
-      }
-
-
-      /*
-       * STEP 2:
-       * OPEN OPUS AUDIO SOCKET.
-       */
-
-      const audioUrl =
-        buildAudioUrl(
-          uuid,
-          frequency,
-          mode
-        );
-
-
-      log(
-        "OPENING UBERSDR OPUS AUDIO SOCKET"
-      );
-
-
-      let ws;
-
-
-      try {
-
-        ws =
-          new WebSocket(
-            audioUrl,
-            {
-              handshakeTimeout:
-                15000,
-
-              perMessageDeflate:
-                false,
-
-              headers: {
-                "User-Agent":
-                  CLIENT_NAME
-              }
-            }
-          );
-
-      }
-
-      catch (err) {
-
-        connecting = false;
-
-
-        log(
-          "WS CREATE ERROR:",
-          err.message
-        );
-
-
-        scheduleReconnect();
-
-        return;
-      }
-
-
-      upstream = ws;
-
-      ws.binaryType =
-        "nodebuffer";
-
-
-      /* ------------------------------------------------------
-         OPEN
-         ------------------------------------------------------ */
-
-      ws.on(
-        "open",
-        () => {
-
-          if (
-            closed ||
-            upstream !== ws
-          ) {
-            return;
+          headers: {
+            "User-Agent":
+              CLIENT
           }
-
-
-          connecting = false;
-
-
-          log(
-            "================================"
-          );
-
-          log(
-            "UBERSDR AUDIO SOCKET OPEN"
-          );
-
-          log(
-            "================================"
-          );
-
-
-          sendBrowser({
-            type: "upstream",
-            status: "connected",
-            frequency,
-            mode
-          });
-
         }
       );
 
 
-      /* ------------------------------------------------------
-         RECEIVE UBERSDR DATA
-         ------------------------------------------------------ */
+    upstream.binaryType =
+      "nodebuffer";
 
-      ws.on(
-        "message",
-        (data, isBinary) => {
 
-          if (
-            closed ||
-            upstream !== ws
+    upstream.on(
+      "open",
+      () => {
+
+        log(
+          "UBERSDR AUDIO OPEN"
+        );
+
+      }
+    );
+
+
+    upstream.on(
+      "message",
+      (data, isBinary) => {
+
+        if (!isBinary) {
+          return;
+        }
+
+
+        const packet =
+          Buffer.isBuffer(data)
+            ? data
+            : Buffer.from(data);
+
+
+        /*
+         * UberSDR V2:
+         *
+         * 0-7   timestamp
+         * 8-11  rate
+         * 12    channels
+         * 13-20 signal data
+         * 21+   Opus
+         */
+
+        if (
+          packet.length <= 21
+        ) {
+          return;
+        }
+
+
+        const rate =
+          packet.readUInt32LE(8);
+
+        const channels =
+          packet.readUInt8(12);
+
+
+        if (
+          ![
+            8000,
+            12000,
+            16000,
+            24000,
+            48000
+          ].includes(rate)
+        ) {
+          return;
+        }
+
+
+        if (
+          channels !== 1 &&
+          channels !== 2
+        ) {
+          return;
+        }
+
+
+        if (
+          !decoder ||
+          decoderRate !== rate ||
+          decoderChannels !== channels
+        ) {
+
+          if (decoder) {
+
+            try {
+              decoder.delete();
+            } catch {}
+          }
+
+
+          decoder =
+            new OpusScript(
+              rate,
+              channels,
+              OpusScript.Application.AUDIO
+            );
+
+
+          decoderRate =
+            rate;
+
+          decoderChannels =
+            channels;
+
+
+          log(
+            "OPUS DECODER:",
+            rate,
+            "Hz",
+            channels,
+            "ch"
+          );
+        }
+
+
+        const opus =
+          packet.subarray(21);
+
+
+        let pcm;
+
+
+        try {
+
+          pcm =
+            Buffer.from(
+              decoder.decode(opus)
+            );
+
+        } catch (err) {
+
+          log(
+            "OPUS DECODE ERROR:",
+            err.message
+          );
+
+          return;
+        }
+
+
+        if (!pcm.length) {
+          return;
+        }
+
+
+        /*
+         * Downmix stereo to mono if needed.
+         */
+
+        let mono;
+
+
+        if (channels === 1) {
+
+          mono = pcm;
+
+        } else {
+
+          const frames =
+            Math.floor(
+              pcm.length / 4
+            );
+
+          mono =
+            Buffer.allocUnsafe(
+              frames * 2
+            );
+
+
+          for (
+            let i = 0;
+            i < frames;
+            i++
           ) {
-            return;
-          }
 
+            const left =
+              pcm.readInt16LE(
+                i * 4
+              );
 
-          /*
-           * TEXT MESSAGE
-           */
+            const right =
+              pcm.readInt16LE(
+                i * 4 + 2
+              );
 
-          if (!isBinary) {
-
-            const text =
-              data.toString();
-
-
-            log(
-              "UBERSDR TEXT:",
-              text.slice(0, 500)
-            );
-
-
-            return;
-          }
-
-
-          /*
-           * V2 audio packet must contain:
-           *
-           * 21-byte header
-           * + Opus payload
-           */
-
-          const packet =
-            Buffer.isBuffer(data)
-              ? data
-              : Buffer.from(data);
-
-
-          if (
-            packet.length <= 21
-          ) {
-            return;
-          }
-
-
-          let sampleRate;
-
-          let channels;
-
-          let basebandPower;
-
-          let noiseDensity;
-
-
-          try {
-
-            sampleRate =
-              packet.readUInt32LE(8);
-
-            channels =
-              packet.readUInt8(12);
-
-            basebandPower =
-              packet.readFloatLE(13);
-
-            noiseDensity =
-              packet.readFloatLE(17);
-
-          }
-
-          catch (err) {
-
-            log(
-              "V2 HEADER READ ERROR:",
-              err.message
-            );
-
-            return;
-          }
-
-
-          /*
-           * Validate audio format.
-           */
-
-          if (
-            ![
-              8000,
-              12000,
-              16000,
-              24000,
-              48000
-            ].includes(sampleRate)
-          ) {
-
-            log(
-              "UNSUPPORTED SAMPLE RATE:",
-              sampleRate
-            );
-
-            return;
-          }
-
-
-          if (
-            channels !== 1 &&
-            channels !== 2
-          ) {
-
-            log(
-              "UNSUPPORTED CHANNEL COUNT:",
-              channels
-            );
-
-            return;
-          }
-
-
-          /*
-           * OPUS PAYLOAD STARTS AT BYTE 21.
-           */
-
-          const opus =
-            packet.subarray(21);
-
-
-          try {
-
-            ensureDecoder(
-              sampleRate,
-              channels
-            );
-
-
-            const pcm =
-              Buffer.from(
-                opusDecoder.decode(
-                  opus
+            const mixed =
+              Math.max(
+                -32768,
+                Math.min(
+                  32767,
+                  Math.round(
+                    (left + right) / 2
+                  )
                 )
               );
 
 
-            if (!pcm.length) {
-              return;
-            }
-
-
-            /*
-             * Calculate S-meter signal.
-             */
-
-            lastRssi =
-              powerToDbm(
-                basebandPower
-              );
-
-
-            /*
-             * Convert to the exact packet format
-             * that the CURRENT ACURA webpage
-             * already knows how to play.
-             */
-
-            const acuraPacket =
-              makeAcuraPacket(
-                pcm,
-                lastRssi
-              );
-
-
-            /*
-             * SEND PCM TO THE WEBPAGE.
-             */
-
-            if (
-              browser.readyState ===
-              WebSocket.OPEN
-            ) {
-
-              browser.send(
-                acuraPacket,
-                {
-                  binary: true
-                }
-              );
-
-            }
-
-
-            packetCount++;
-
-
-            if (
-              packetCount === 1
-            ) {
-
-              log(
-                "================================"
-              );
-
-              log(
-                "FIRST OPUS PACKET DECODED TO PCM"
-              );
-
-              log(
-                "Input:",
-                sampleRate,
-                "Hz",
-                channels,
-                "channel(s)"
-              );
-
-              log(
-                "Opus bytes:",
-                opus.length
-              );
-
-              log(
-                "PCM bytes:",
-                pcm.length
-              );
-
-              log(
-                "ACURA packet:",
-                acuraPacket.length
-              );
-
-              log(
-                "================================"
-              );
-
-
-              /*
-               * Reassert VFO once actual
-               * receiver audio is flowing.
-               */
-
-              sendTune();
-
-            }
-
-
-            if (
-              packetCount <= 3 ||
-              packetCount % 500 === 0
-            ) {
-
-              log(
-                `PCM AUDIO PACKET #${packetCount}`,
-                `${pcm.length} bytes`
-              );
-
-            }
-
-          }
-
-          catch (err) {
-
-            log(
-              "OPUS DECODE ERROR:",
-              err.message
+            mono.writeInt16LE(
+              mixed,
+              i * 2
             );
-
           }
-
         }
-      );
 
 
-      /* ------------------------------------------------------
-         ERROR
-         ------------------------------------------------------ */
+        /*
+         * Browser packet:
+         *
+         * PCM1
+         * rate uint32 LE
+         * PCM16 LE mono
+         */
 
-      ws.on(
-        "error",
-        err => {
-
-          log(
-            "UBERSDR WS ERROR:",
-            err.message
-          );
-
-        }
-      );
-
-
-      /* ------------------------------------------------------
-         CLOSE
-         ------------------------------------------------------ */
-
-      ws.on(
-        "close",
-        (code, reason) => {
-
-          if (
-            upstream !== ws
-          ) {
-            return;
-          }
-
-
-          connecting = false;
-
-          upstream = null;
-
-
-          log(
-            "UBERSDR WS CLOSED:",
-            code,
-            reason
-              ? reason.toString()
-              : ""
+        const out =
+          Buffer.allocUnsafe(
+            8 + mono.length
           );
 
 
-          sendBrowser({
-            type: "upstream",
-            status: "disconnected",
-            code
+        out.write(
+          "PCM1",
+          0,
+          "ascii"
+        );
+
+
+        out.writeUInt32LE(
+          rate,
+          4
+        );
+
+
+        mono.copy(
+          out,
+          8
+        );
+
+
+        if (
+          browser.readyState ===
+          WebSocket.OPEN
+        ) {
+
+          browser.send(
+            out,
+            {
+              binary: true
+            }
+          );
+        }
+
+
+        if (firstAudio) {
+
+          firstAudio = false;
+
+
+          log(
+            "FIRST PCM AUDIO SENT TO TEST PAGE"
+          );
+
+
+          sendJSON({
+            type: "audio",
+            rate
           });
 
 
-          if (!closed) {
-            scheduleReconnect();
-          }
-
-        }
-      );
-
-
-      ws.on(
-        "ping",
-        data => {
-
-          try {
-            ws.pong(data);
-          }
-
-          catch {}
-
-        }
-      );
-
-    }
-
-
-    /* ========================================================
-       COMMANDS FROM ACURA
-       ======================================================== */
-
-    browser.on(
-      "message",
-      (raw, isBinary) => {
-
-        if (isBinary) {
-          return;
-        }
-
-
-        let msg;
-
-
-        try {
-
-          msg =
-            JSON.parse(
-              raw.toString()
-            );
-
-        }
-
-        catch {
-          return;
-        }
-
-
-        /*
-         * POWER
-         */
-
-        if (
-          msg.type === "connect" ||
-          msg.type === "start" ||
-          msg.type === "power"
-        ) {
+          /*
+           * Reassert 7.255 LSB.
+           */
 
           if (
-            msg.frequency !== undefined
-          ) {
-
-            frequency =
-              normalizeFrequency(
-                msg.frequency
-              );
-
-          }
-
-
-          if (msg.mode) {
-
-            mode =
-              normalizeMode(
-                msg.mode
-              );
-
-          }
-
-
-          connectUpstream();
-
-          return;
-        }
-
-
-        /*
-         * TUNE
-         */
-
-        if (
-          msg.type === "tune" ||
-          msg.type === "frequency" ||
-          msg.type === "setFrequency"
-        ) {
-
-          const rawFreq =
-            msg.frequency ??
-            msg.freq ??
-            msg.value;
-
-
-          if (
-            rawFreq !== undefined
-          ) {
-
-            frequency =
-              normalizeFrequency(
-                rawFreq
-              );
-
-          }
-
-
-          if (msg.mode) {
-
-            mode =
-              normalizeMode(
-                msg.mode
-              );
-
-          }
-
-
-          log(
-            "ACURA TUNE REQUEST ->",
-            frequency,
-            "Hz",
-            mode
-          );
-
-
-          sendTune();
-
-          return;
-        }
-
-
-        /*
-         * MODE
-         */
-
-        if (
-          msg.type === "mode"
-        ) {
-
-          mode =
-            normalizeMode(
-              msg.mode
-            );
-
-
-          sendTune();
-
-          return;
-        }
-
-
-        /*
-         * OTHER UBERSDR CONTROL MESSAGES
-         */
-
-        if (
-          upstream &&
-          upstream.readyState ===
+            upstream.readyState ===
             WebSocket.OPEN
-        ) {
-
-          try {
+          ) {
 
             upstream.send(
-              JSON.stringify(msg)
+              JSON.stringify({
+                type: "tune",
+                frequency:
+                  FREQUENCY,
+                mode:
+                  MODE
+              })
             );
-
           }
-
-          catch {}
-
         }
 
       }
     );
 
 
-    /* ========================================================
-       DISCONNECT
-       ======================================================== */
+    upstream.on(
+      "error",
+      err => {
+
+        log(
+          "UBERSDR ERROR:",
+          err.message
+        );
+
+
+        sendJSON({
+          type: "error",
+          message:
+            err.message
+        });
+
+      }
+    );
+
+
+    upstream.on(
+      "close",
+      (code, reason) => {
+
+        log(
+          "UBERSDR CLOSED:",
+          code,
+          reason
+            ? reason.toString()
+            : ""
+        );
+
+      }
+    );
+
 
     browser.on(
       "close",
       () => {
 
-        closed = true;
-
-
-        if (reconnectTimer) {
-          clearTimeout(
-            reconnectTimer
-          );
-        }
-
-
-        if (upstream) {
-
-          try {
-            upstream.close();
-          }
-
-          catch {}
-
-
-          upstream = null;
-        }
-
-
-        if (opusDecoder) {
-
-          try {
-            opusDecoder.delete();
-          }
-
-          catch {}
-
-
-          opusDecoder = null;
-        }
-
-
         log(
-          "ACURA SDR visitor disconnected"
+          "TEST BROWSER DISCONNECTED"
         );
+
+        destroy();
 
       }
     );
-
-
-    sendBrowser({
-      type: "bridge",
-      status: "ready",
-      protocol:
-        "UberSDR-V2-to-ACURA-PCM"
-    });
-
-
-    /*
-     * Start immediately.
-     */
-
-    connectUpstream();
-
-  }
-);
-
-
-/* ============================================================
-   STATUS
-   ============================================================ */
-
-app.get(
-  "/",
-  (req, res) => {
-
-    res
-      .type("text/plain")
-      .send(
-`ACURA DX-1000 SDR BRIDGE
-STATUS: ONLINE
-
-UPSTREAM:
-UberSDR V2 OPUS
-
-DOWNSTREAM:
-ACURA PCM16
-
-SESSION:
-POST /connection
-
-AUDIO SOCKET:
-/ws
-
-BROWSER SOCKET:
-/sdr
-
-OPUS DECODING:
-SERVER SIDE ENABLED
-`
-      );
-
-  }
-);
-
-
-app.get(
-  "/health",
-  (req, res) => {
-
-    res.json({
-      ok: true,
-
-      bridge:
-        "ACURA DX-1000",
-
-      upstream:
-        "UberSDR V2 Opus",
-
-      decoder:
-        "opusscript",
-
-      output:
-        "PCM16-BE",
-
-      browser:
-        "/sdr"
-    });
 
   }
 );
@@ -1581,47 +991,27 @@ server.listen(
   () => {
 
     console.log("");
-
     console.log(
-      "================================"
+      "=============================="
     );
-
     console.log(
-      "ACURA DX-1000 SDR BRIDGE"
+      "ACURA SDR AUDIO-ONLY TEST"
     );
-
     console.log(
-      "================================"
+      "=============================="
     );
-
     console.log(
-      `Port: ${PORT}`
+      "Frequency: 7.255 MHz LSB"
     );
-
     console.log(
-      "Browser socket: /sdr"
+      "Test page: /test"
     );
-
     console.log(
-      "Upstream: UberSDR V2 OPUS"
+      "No ACURA radio code"
     );
-
     console.log(
-      "Server OPUS decoder: ENABLED"
+      "=============================="
     );
-
-    console.log(
-      "Browser output: PCM16"
-    );
-
-    console.log(
-      "Existing ACURA webpage decoder: COMPATIBLE"
-    );
-
-    console.log(
-      "================================"
-    );
-
     console.log("");
 
   }
