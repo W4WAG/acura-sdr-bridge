@@ -1,567 +1,1480 @@
+"use strict";
+
 const express = require("express");
 const http = require("http");
 const WebSocket = require("ws");
+const crypto = require("crypto");
 
 const app = express();
 const server = http.createServer(app);
 
-const PORT = process.env.PORT || 3000;
-const KIWI_URL = process.env.KIWI_URL || "";
+const PORT = Number(process.env.PORT || 8080);
 
-app.use(express.json());
+const UPSTREAM_BASE =
+  process.env.UPSTREAM_BASE ||
+  process.env.UBERSDR_BASE ||
+  process.env.UPSTREAM_URL ||
+  process.env.UBERSDR_URL ||
+  "https://ubersdr.k3fef.com";
 
-app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+const UPSTREAM_PASSWORD =
+  process.env.UPSTREAM_PASSWORD ||
+  process.env.UBERSDR_PASSWORD ||
+  "";
 
-  if (req.method === "OPTIONS") {
-    return res.sendStatus(204);
-  }
+const ADMIN_SUFFIX =
+  process.env.ADMIN_SUFFIX ||
+  process.env.UBERSDR_ADMIN_SUFFIX ||
+  "";
 
-  next();
-});
+const CLIENT_NAME =
+  "VibeSDR/10 (+https://vibesdr.net)";
+
+const DEFAULT_FREQ = 7255000;
+const DEFAULT_MODE = "lsb";
 
 
-/* =========================================================
-   ACURA DX-1000 BRIDGE HOME
-========================================================= */
+/* ============================================================
+   LOGGING
+   ============================================================ */
 
-app.get("/", (req, res) => {
-  res.type("html").send(`
-<!doctype html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>ACURA DX-1000 SDR Bridge</title>
-<style>
-body{
-  margin:0;
-  background:#020b11;
-  color:#55eaff;
-  font-family:Arial,sans-serif;
-  text-align:center;
-  padding:70px 20px;
+function log(...args) {
+  console.log(
+    new Date().toISOString(),
+    ...args
+  );
 }
-h1{
-  letter-spacing:4px;
-  text-shadow:0 0 18px #00d9ff;
-}
-.box{
-  max-width:650px;
-  margin:35px auto;
-  padding:28px;
-  border:1px solid #0d6274;
-  border-radius:14px;
-  background:#06141d;
-}
-.ok{color:#65ff91;}
-</style>
-</head>
-<body>
-<h1>ACURA DX-1000</h1>
-<h2>LIVE HF SDR BRIDGE</h2>
-
-<div class="box">
-<h3 class="ok">● SERVER ONLINE</h3>
-<p>Atlantic Coast United Radio Association</p>
-<p>Live KiwiSDR Gateway</p>
-</div>
-</body>
-</html>
-  `);
-});
 
 
-/* =========================================================
-   HEALTH
-========================================================= */
+/* ============================================================
+   HELPERS
+   ============================================================ */
 
-app.get("/health", (req, res) => {
-  res.json({
-    ok: true,
-    service: "ACURA DX-1000 SDR Bridge",
-    kiwiConfigured: Boolean(KIWI_URL),
-    time: new Date().toISOString()
-  });
-});
-
-
-/* =========================================================
-   STATUS
-========================================================= */
-
-app.get("/api/status", (req, res) => {
-  res.json({
-    online: true,
-    kiwiConfigured: Boolean(KIWI_URL),
-    kiwiUrl: KIWI_URL || null,
-    system: "ACURA DX-1000",
-    mode: "RX ONLY"
-  });
-});
-
-
-/* =========================================================
-   BASIC KIWI HTTP TEST
-========================================================= */
-
-app.get("/api/kiwi-test", async (req, res) => {
-
-  if (!KIWI_URL) {
-    return res.status(500).json({
-      ok: false,
-      error: "KIWI_URL not configured"
-    });
+function makeUuid() {
+  if (
+    typeof crypto.randomUUID ===
+    "function"
+  ) {
+    return crypto.randomUUID();
   }
 
-  try {
-
-    const response = await fetch(KIWI_URL, {
-      signal: AbortSignal.timeout(10000)
-    });
-
-    res.json({
-      ok: true,
-      reachable: response.ok,
-      status: response.status,
-      statusText: response.statusText
-    });
-
-  } catch (error) {
-
-    res.status(502).json({
-      ok: false,
-      reachable: false,
-      error: error.message
-    });
-
-  }
-});
-
-
-/* =========================================================
-   KIWI WEBSOCKET TEST
-========================================================= */
-
-app.get("/api/kiwi-ws-test", (req, res) => {
-
-  if (!KIWI_URL) {
-    return res.status(500).json({
-      ok: false,
-      error: "KIWI_URL not configured"
-    });
-  }
-
-  const parsed = new URL(KIWI_URL);
-
-  const wsProtocol =
-    parsed.protocol === "https:" ? "wss:" : "ws:";
-
-  const stamp = Math.floor(Date.now() / 1000);
-
-  const wsUrl =
-    `${wsProtocol}//${parsed.host}/${stamp}/SND`;
-
-  let finished = false;
-
-  const kiwi = new WebSocket(wsUrl, {
-    handshakeTimeout: 10000
-  });
-
-  const finish = (code, data) => {
-
-    if (finished) return;
-
-    finished = true;
-
-    try {
-      kiwi.close();
-    } catch (_) {}
-
-    res.status(code).json(data);
-  };
-
-  const timer = setTimeout(() => {
-
-    finish(504, {
-      ok: false,
-      error: "Kiwi WebSocket timeout"
-    });
-
-  }, 12000);
-
-  kiwi.on("open", () => {
-    kiwi.send("SET auth t=kiwi p=");
-  });
-
-  kiwi.on("message", (data) => {
-
-    clearTimeout(timer);
-
-    const packet = Buffer.from(data);
-
-    finish(200, {
-      ok: true,
-      websocketConnected: true,
-      firstMessageTag:
-        packet.subarray(0, 3).toString("ascii"),
-      messageBytes: packet.length
-    });
-
-  });
-
-  kiwi.on("error", (error) => {
-
-    clearTimeout(timer);
-
-    finish(502, {
-      ok: false,
-      websocketConnected: false,
-      error: error.message
-    });
-
-  });
-
-});
-
-
-/* =========================================================
-   RECEIVER HELPERS
-========================================================= */
-
-const filters = {
-
-  usb: [300, 2700],
-  lsb: [-2700, -300],
-  am: [-4900, 4900],
-  cw: [300, 700]
-
-};
-
-
-function normalizeMode(mode) {
-
-  mode =
-    String(mode || "usb").toLowerCase();
-
-  return filters[mode] ? mode : "usb";
+  return crypto
+    .randomBytes(16)
+    .toString("hex");
 }
 
 
 function normalizeFrequency(value) {
-
   let f = Number(value);
 
-  if (!Number.isFinite(f)) {
-    return 14250;
+  if (
+    !Number.isFinite(f) ||
+    f <= 0
+  ) {
+    return DEFAULT_FREQ;
   }
 
-  /* Hz -> kHz */
-  if (f > 100000) {
-    f /= 1000;
+  /*
+   * ACURA may send:
+   *
+   * 7.255
+   * 7255
+   * 7255000
+   */
+
+  if (f < 1000) {
+    f *= 1000000;
   }
 
-  return Math.min(
-    30000,
-    Math.max(10, f)
+  else if (f < 1000000) {
+    f *= 1000;
+  }
+
+  return Math.round(f);
+}
+
+
+function normalizeMode(value) {
+  let mode =
+    String(
+      value || DEFAULT_MODE
+    ).toLowerCase();
+
+  if (mode === "cw") {
+    mode = "cwu";
+  }
+
+  const allowed =
+    new Set([
+      "usb",
+      "lsb",
+      "am",
+      "sam",
+      "fm",
+      "nfm",
+      "cwu",
+      "cwl"
+    ]);
+
+  return allowed.has(mode)
+    ? mode
+    : DEFAULT_MODE;
+}
+
+
+function httpBase() {
+  let base =
+    String(
+      UPSTREAM_BASE || ""
+    ).trim();
+
+  base =
+    base.replace(
+      /^ws:/i,
+      "http:"
+    );
+
+  base =
+    base.replace(
+      /^wss:/i,
+      "https:"
+    );
+
+  return base.replace(
+    /\/+$/,
+    ""
   );
 }
 
 
-function makeTuneCommand(frequency, mode) {
+function wsBase() {
+  const base = httpBase();
 
-  const m = normalizeMode(mode);
-  const f = normalizeFrequency(frequency);
-  const [low, high] = filters[m];
+  if (
+    base.startsWith(
+      "https://"
+    )
+  ) {
+    return (
+      "wss://" +
+      base.slice(8)
+    );
+  }
 
-  return (
-    `SET mod=${m}` +
-    ` low_cut=${low}` +
-    ` high_cut=${high}` +
-    ` freq=${f.toFixed(3)}`
-  );
+  if (
+    base.startsWith(
+      "http://"
+    )
+  ) {
+    return (
+      "ws://" +
+      base.slice(7)
+    );
+  }
+
+  return "wss://" + base;
 }
 
 
-/* =========================================================
-   LIVE ACURA SDR SOCKET
+function adminQuery() {
+  if (!ADMIN_SUFFIX) {
+    return "";
+  }
 
-   WordPress will connect to:
-
-   wss://acura-sdr-bridge-production.up.railway.app/sdr
-========================================================= */
-
-const wss = new WebSocket.Server({
-  server,
-  path: "/sdr"
-});
+  return ADMIN_SUFFIX.startsWith("&")
+    ? ADMIN_SUFFIX
+    : "&" + ADMIN_SUFFIX;
+}
 
 
-wss.on("connection", (browser) => {
+/* ============================================================
+   UBERSDR SESSION REGISTRATION
+   ============================================================ */
 
-  console.log("ACURA SDR visitor connected");
+async function registerSession(uuid) {
+  const url =
+    `${httpBase()}/connection?user_session_id=` +
+    encodeURIComponent(uuid) +
+    adminQuery();
 
-  if (!KIWI_URL) {
+  log(
+    "REGISTERING UBERSDR SESSION"
+  );
 
-    browser.send(JSON.stringify({
-      type: "error",
-      message: "KIWI_URL not configured"
-    }));
+  log(
+    "POST /connection uuid=" +
+    uuid
+  );
 
-    return browser.close();
+  const body = {
+    user_session_id: uuid
+  };
+
+  if (UPSTREAM_PASSWORD) {
+    body.password =
+      UPSTREAM_PASSWORD;
+  }
+
+  let response;
+
+  try {
+    response =
+      await fetch(
+        url,
+        {
+          method: "POST",
+
+          headers: {
+            "Content-Type":
+              "application/json",
+
+            "User-Agent":
+              CLIENT_NAME,
+
+            "X-Requested-With":
+              "VibeSDR"
+          },
+
+          body:
+            JSON.stringify(body)
+        }
+      );
+  }
+
+  catch (err) {
+    throw new Error(
+      "POST /connection failed: " +
+      err.message
+    );
   }
 
 
-  const parsed = new URL(KIWI_URL);
-
-  const wsProtocol =
-    parsed.protocol === "https:" ? "wss:" : "ws:";
-
-  const stamp = Math.floor(Date.now() / 1000);
-
-  const kiwiWsUrl =
-  `${wsProtocol}//${parsed.host}/${stamp}/SND`;
+  const text =
+    await response.text();
 
 
-  let frequency = 14250;
-  let mode = "usb";
-  let configured = false;
-  let keepalive = null;
+  if (!response.ok) {
+    throw new Error(
+      `POST /connection HTTP ${response.status}: ` +
+      text.slice(0, 300)
+    );
+  }
 
 
-  browser.send(JSON.stringify({
-    type: "bridge",
-    status: "connecting",
-    receiver: parsed.host
-  }));
+  let result = {};
+
+  try {
+    result =
+      JSON.parse(text);
+  }
+
+  catch {
+    result = {
+      allowed: true
+    };
+  }
 
 
-  const kiwi = new WebSocket(kiwiWsUrl, {
-    handshakeTimeout: 10000
+  log(
+    "CONNECTION RESPONSE:",
+    JSON.stringify(result)
+      .slice(0, 800)
+  );
+
+
+  if (
+    result.allowed === false
+  ) {
+    throw new Error(
+      "UberSDR refused session: " +
+      (
+        result.reason ||
+        "unknown reason"
+      )
+    );
+  }
+
+
+  return result;
+}
+
+
+/* ============================================================
+   UBERSDR AUDIO URL
+
+   Matches VibePowerModule.swift:
+
+   /ws
+   ?user_session_id=
+   &frequency=
+   &mode=
+   &format=opus
+   &version=2
+   &client=
+   ============================================================ */
+
+function buildAudioUrl(
+  uuid,
+  frequency,
+  mode
+) {
+
+  const params =
+    new URLSearchParams();
+
+  params.set(
+    "user_session_id",
+    uuid
+  );
+
+  params.set(
+    "frequency",
+    String(frequency)
+  );
+
+  params.set(
+    "mode",
+    mode
+  );
+
+  params.set(
+    "format",
+    "opus"
+  );
+
+  params.set(
+    "version",
+    "2"
+  );
+
+  params.set(
+    "client",
+    CLIENT_NAME
+  );
+
+
+  if (UPSTREAM_PASSWORD) {
+    params.set(
+      "password",
+      UPSTREAM_PASSWORD
+    );
+  }
+
+
+  let url =
+    `${wsBase()}/ws?${params.toString()}`;
+
+
+  if (ADMIN_SUFFIX) {
+    url += adminQuery();
+  }
+
+
+  return url;
+}
+
+
+/* ============================================================
+   BROWSER WEBSOCKET
+   ============================================================ */
+
+const browserWss =
+  new WebSocket.Server({
+    noServer: true,
+    perMessageDeflate: false
   });
 
 
-  function sendKiwi(command) {
+server.on(
+  "upgrade",
+  (req, socket, head) => {
 
-    if (kiwi.readyState === WebSocket.OPEN) {
-      kiwi.send(command);
+    let pathname;
+
+    try {
+      pathname =
+        new URL(
+          req.url,
+          `http://${req.headers.host || "localhost"}`
+        ).pathname;
     }
-  }
+
+    catch {
+      socket.destroy();
+      return;
+    }
 
 
-  function configureKiwi() {
+    if (
+      pathname !== "/sdr"
+    ) {
+      socket.destroy();
+      return;
+    }
 
-    if (configured) return;
 
-    configured = true;
-sendKiwi("SET AR OK in=12000 out=44100");
-    sendKiwi("SET ident_user=ACURA-DX");
+    browserWss.handleUpgrade(
+      req,
+      socket,
+      head,
+      ws => {
 
-    sendKiwi(
-      makeTuneCommand(frequency, mode)
+        browserWss.emit(
+          "connection",
+          ws,
+          req
+        );
+
+      }
     );
 
-    sendKiwi(
-      "SET agc=1 hang=0 thresh=-100 slope=6 decay=1000 manGain=50"
+  }
+);
+
+
+/* ============================================================
+   ACURA CLIENT
+   ============================================================ */
+
+browserWss.on(
+  "connection",
+  browser => {
+
+    log(
+      "ACURA SDR visitor connected"
     );
 
-    sendKiwi("SET compression=0");
 
-    sendKiwi("SET squelch=0 max=0");
+    let upstream = null;
 
-    sendKiwi("SET keepalive");
+    let closed = false;
 
-    keepalive = setInterval(() => {
-      sendKiwi("SET keepalive");
-    }, 5000);
+    let connecting = false;
 
+    let reconnectTimer = null;
 
-    browser.send(JSON.stringify({
-      type: "receiver",
-      status: "live",
-      frequency,
-      mode
-    }));
-  }
+    let firstPacket = true;
 
+    let packetCount = 0;
 
-  kiwi.on("open", () => {
+    let frequency =
+      DEFAULT_FREQ;
 
-    console.log("Kiwi SND socket connected");
+    let mode =
+      DEFAULT_MODE;
 
-    sendKiwi("SET auth t=kiwi p=");
+    /*
+     * SAME UUID for registration
+     * and audio WebSocket.
+     */
 
-    browser.send(JSON.stringify({
-      type: "kiwi",
-      status: "connected"
-    }));
-  });
+    const uuid =
+      makeUuid();
 
 
-  kiwi.on("message", (data) => {
+    function sendBrowser(obj) {
+      if (
+        browser.readyState !==
+        WebSocket.OPEN
+      ) {
+        return;
+      }
 
-    const packet = Buffer.from(data);
+      try {
+        browser.send(
+          JSON.stringify(obj)
+        );
+      }
 
-    if (packet.length < 3) return;
-
-    const tag =
-      packet.subarray(0, 3).toString("ascii");
+      catch {}
+    }
 
 
-    /* Kiwi setup messages */
+    /* ========================================================
+       LIVE TUNE
+       ======================================================== */
 
-    if (tag === "MSG") {
+    function sendTune() {
+      if (
+        !upstream ||
+        upstream.readyState !==
+        WebSocket.OPEN
+      ) {
 
-      const text =
-        packet.subarray(4).toString("utf8");
+        log(
+          "Tune queued until upstream is ready"
+        );
+
+        /*
+         * IMPORTANT FIX:
+         *
+         * If a tune command is the first command
+         * ACURA sends, START THE UPSTREAM.
+         */
+
+        connectUpstream();
+
+        return;
+      }
+
+
+      const command = {
+        type: "tune",
+        frequency,
+        mode
+      };
+
+
+      try {
+        upstream.send(
+          JSON.stringify(command)
+        );
+
+        log(
+          "LIVE TUNE SENT ->",
+          frequency,
+          "Hz",
+          mode
+        );
+      }
+
+      catch (err) {
+        log(
+          "TUNE SEND ERROR:",
+          err.message
+        );
+      }
+    }
+
+
+    /* ========================================================
+       RECONNECT
+       ======================================================== */
+
+    function scheduleReconnect() {
+      if (
+        closed ||
+        reconnectTimer
+      ) {
+        return;
+      }
+
+      reconnectTimer =
+        setTimeout(
+          () => {
+
+            reconnectTimer = null;
+
+            if (!closed) {
+              connectUpstream();
+            }
+
+          },
+          2000
+        );
+    }
+
+
+    /* ========================================================
+       CONNECT UBERSDR
+       ======================================================== */
+
+    async function connectUpstream() {
+
+      if (
+        closed ||
+        connecting
+      ) {
+        return;
+      }
 
 
       if (
-        text.includes("sample_rate=") ||
-        text.includes("audio_rate=")
+        upstream &&
+        (
+          upstream.readyState ===
+            WebSocket.OPEN ||
+
+          upstream.readyState ===
+            WebSocket.CONNECTING
+        )
       ) {
-
-        configureKiwi();
+        return;
       }
 
 
-      if (browser.readyState === WebSocket.OPEN) {
-
-        browser.send(JSON.stringify({
-          type: "kiwi-msg",
-          value: text
-        }));
-      }
-
-      return;
-    }
+      connecting = true;
 
 
-    /* Real Kiwi received audio packet */
-
-    if (tag === "SND") {
-
-      if (browser.readyState === WebSocket.OPEN) {
-
-        browser.send(packet, {
-          binary: true
-        });
-      }
-
-      return;
-    }
-
-  });
-
-
-  /* Commands from ACURA radio */
-
-  browser.on("message", (data, isBinary) => {
-
-    if (isBinary) return;
-
-    let message;
-
-    try {
-      message =
-        JSON.parse(data.toString());
-    } catch (_) {
-      return;
-    }
-
-
-    if (message.type === "tune") {
-
-      frequency =
-        normalizeFrequency(message.frequency);
-
-      mode =
-        normalizeMode(message.mode || mode);
-
-      sendKiwi(
-        makeTuneCommand(frequency, mode)
+      log(
+        "================================"
       );
 
+      log(
+        "STARTING UBERSDR CONNECTION"
+      );
 
-      browser.send(JSON.stringify({
-        type: "tuned",
+      log(
+        "Frequency:",
         frequency,
-        mode
-      }));
-    }
-
-
-    if (message.type === "mode") {
-
-      mode =
-        normalizeMode(message.mode);
-
-      sendKiwi(
-        makeTuneCommand(frequency, mode)
+        "Hz"
       );
+
+      log(
+        "Mode:",
+        mode
+      );
+
+      log(
+        "UUID:",
+        uuid
+      );
+
+      log(
+        "================================"
+      );
+
+
+      /* ------------------------------------------------------
+         STEP 1 — REGISTER SESSION
+         ------------------------------------------------------ */
+
+      try {
+        await registerSession(
+          uuid
+        );
+
+        log(
+          "UBERSDR SESSION REGISTERED"
+        );
+      }
+
+      catch (err) {
+
+        connecting = false;
+
+        log(
+          "SESSION REGISTRATION FAILED:",
+          err.message
+        );
+
+        sendBrowser({
+          type: "error",
+          stage: "registration",
+          message: err.message
+        });
+
+        scheduleReconnect();
+
+        return;
+      }
+
+
+      if (closed) {
+        connecting = false;
+        return;
+      }
+
+
+      /* ------------------------------------------------------
+         STEP 2 — OPEN AUDIO WS
+         ------------------------------------------------------ */
+
+      const audioUrl =
+        buildAudioUrl(
+          uuid,
+          frequency,
+          mode
+        );
+
+
+      log(
+        "OPENING UBERSDR AUDIO SOCKET"
+      );
+
+
+      let ws;
+
+      try {
+
+        ws =
+          new WebSocket(
+            audioUrl,
+            {
+              handshakeTimeout:
+                15000,
+
+              perMessageDeflate:
+                false,
+
+              headers: {
+                "User-Agent":
+                  CLIENT_NAME
+              }
+            }
+          );
+
+      }
+
+      catch (err) {
+
+        connecting = false;
+
+        log(
+          "WS CREATE ERROR:",
+          err.message
+        );
+
+        scheduleReconnect();
+
+        return;
+      }
+
+
+      upstream = ws;
+
+      ws.binaryType =
+        "nodebuffer";
+
+
+      /* ------------------------------------------------------
+         OPEN
+         ------------------------------------------------------ */
+
+      ws.on(
+        "open",
+        () => {
+
+          if (
+            closed ||
+            upstream !== ws
+          ) {
+            return;
+          }
+
+
+          connecting = false;
+
+
+          log(
+            "================================"
+          );
+
+          log(
+            "UBERSDR AUDIO SOCKET OPEN"
+          );
+
+          log(
+            "================================"
+          );
+
+
+          sendBrowser({
+            type: "upstream",
+            status: "connected",
+            frequency,
+            mode
+          });
+
+        }
+      );
+
+
+      /* ------------------------------------------------------
+         MESSAGES
+         ------------------------------------------------------ */
+
+      ws.on(
+        "message",
+        (data, isBinary) => {
+
+          if (
+            closed ||
+            upstream !== ws
+          ) {
+            return;
+          }
+
+
+          /* ==================================================
+             TEXT
+             ================================================== */
+
+          if (!isBinary) {
+
+            const text =
+              data.toString();
+
+
+            log(
+              "UBERSDR TEXT:",
+              text.slice(0, 500)
+            );
+
+
+            if (
+              browser.readyState ===
+              WebSocket.OPEN
+            ) {
+              browser.send(text);
+            }
+
+
+            return;
+          }
+
+
+          /* ==================================================
+             AUDIO
+             ================================================== */
+
+          const packet =
+            Buffer.isBuffer(data)
+              ? data
+              : Buffer.from(data);
+
+
+          if (
+            packet.length <= 21
+          ) {
+            return;
+          }
+
+
+          packetCount++;
+
+
+          let sampleRate = 0;
+
+          let channels = 0;
+
+          let basebandPower = 0;
+
+          let noiseDensity = 0;
+
+
+          try {
+
+            sampleRate =
+              packet.readUInt32LE(8);
+
+            channels =
+              packet.readUInt8(12);
+
+            basebandPower =
+              packet.readFloatLE(13);
+
+            noiseDensity =
+              packet.readFloatLE(17);
+
+          }
+
+          catch {
+            return;
+          }
+
+
+          /*
+           * VibePowerModule.swift reasserts tune
+           * after the FIRST audio packet.
+           */
+
+          if (firstPacket) {
+
+            firstPacket = false;
+
+
+            log(
+              "================================"
+            );
+
+            log(
+              "FIRST LIVE AUDIO PACKET"
+            );
+
+            log(
+              "Sample Rate:",
+              sampleRate
+            );
+
+            log(
+              "Channels:",
+              channels
+            );
+
+            log(
+              "================================"
+            );
+
+
+            sendTune();
+
+          }
+
+
+          /*
+           * Forward COMPLETE V2 packet.
+           */
+
+          if (
+            browser.readyState ===
+            WebSocket.OPEN
+          ) {
+
+            browser.send(
+              packet,
+              {
+                binary: true
+              }
+            );
+
+          }
+
+
+          /*
+           * Signal data for ACURA S-meter.
+           */
+
+          if (
+            packetCount === 1 ||
+            packetCount % 10 === 0
+          ) {
+
+            sendBrowser({
+              type: "signal",
+
+              basebandPower,
+
+              noiseDensity,
+
+              sampleRate,
+
+              channels,
+
+              frequency,
+
+              mode
+            });
+
+          }
+
+
+          if (
+            packetCount <= 3 ||
+            packetCount % 500 === 0
+          ) {
+
+            log(
+              `AUDIO PACKET #${packetCount}`,
+              `${packet.length} bytes`
+            );
+
+          }
+
+        }
+      );
+
+
+      /* ------------------------------------------------------
+         HTTP REJECTION
+         ------------------------------------------------------ */
+
+      ws.on(
+        "unexpected-response",
+        (request, response) => {
+
+          connecting = false;
+
+
+          log(
+            "UPSTREAM HTTP REJECTION:",
+            response.statusCode,
+            response.statusMessage || ""
+          );
+
+
+          let body = "";
+
+
+          response.on(
+            "data",
+            chunk => {
+
+              body +=
+                chunk.toString();
+
+            }
+          );
+
+
+          response.on(
+            "end",
+            () => {
+
+              if (body) {
+
+                log(
+                  "UPSTREAM RESPONSE:",
+                  body.slice(0, 1000)
+                );
+
+              }
+
+            }
+          );
+
+        }
+      );
+
+
+      /* ------------------------------------------------------
+         ERROR
+         ------------------------------------------------------ */
+
+      ws.on(
+        "error",
+        err => {
+
+          log(
+            "UBERSDR WS ERROR:",
+            err.message
+          );
+
+        }
+      );
+
+
+      /* ------------------------------------------------------
+         CLOSE
+         ------------------------------------------------------ */
+
+      ws.on(
+        "close",
+        (code, reason) => {
+
+          if (
+            upstream !== ws
+          ) {
+            return;
+          }
+
+
+          connecting = false;
+
+          upstream = null;
+
+
+          log(
+            "UBERSDR WS CLOSED:",
+            code,
+            reason
+              ? reason.toString()
+              : ""
+          );
+
+
+          sendBrowser({
+            type: "upstream",
+            status: "disconnected",
+            code
+          });
+
+
+          if (!closed) {
+            scheduleReconnect();
+          }
+
+        }
+      );
+
+
+      ws.on(
+        "ping",
+        data => {
+
+          try {
+            ws.pong(data);
+          }
+
+          catch {}
+
+        }
+      );
+
     }
 
-  });
+
+    /* ========================================================
+       COMMANDS FROM ACURA
+       ======================================================== */
+
+    browser.on(
+      "message",
+      (raw, isBinary) => {
+
+        if (isBinary) {
+          return;
+        }
 
 
-  kiwi.on("error", (error) => {
+        let msg;
 
-    console.error(
-      "Kiwi error:",
-      error.message
+
+        try {
+          msg =
+            JSON.parse(
+              raw.toString()
+            );
+        }
+
+        catch {
+          return;
+        }
+
+
+        /* ----------------------------------------------------
+           POWER / START
+           ---------------------------------------------------- */
+
+        if (
+          msg.type === "connect" ||
+          msg.type === "start" ||
+          msg.type === "power"
+        ) {
+
+          if (
+            msg.frequency !==
+            undefined
+          ) {
+
+            frequency =
+              normalizeFrequency(
+                msg.frequency
+              );
+
+          }
+
+
+          if (msg.mode) {
+
+            mode =
+              normalizeMode(
+                msg.mode
+              );
+
+          }
+
+
+          log(
+            "ACURA POWER ->",
+            frequency,
+            "Hz",
+            mode
+          );
+
+
+          connectUpstream();
+
+          return;
+        }
+
+
+        /* ----------------------------------------------------
+           TUNE
+           ---------------------------------------------------- */
+
+        if (
+          msg.type === "tune" ||
+          msg.type === "frequency" ||
+          msg.type === "setFrequency"
+        ) {
+
+          const rawFreq =
+            msg.frequency ??
+            msg.freq ??
+            msg.value;
+
+
+          if (
+            rawFreq !==
+            undefined
+          ) {
+
+            frequency =
+              normalizeFrequency(
+                rawFreq
+              );
+
+          }
+
+
+          if (msg.mode) {
+
+            mode =
+              normalizeMode(
+                msg.mode
+              );
+
+          }
+
+
+          log(
+            "ACURA TUNE REQUEST ->",
+            frequency,
+            "Hz",
+            mode
+          );
+
+
+          sendTune();
+
+          return;
+        }
+
+
+        /* ----------------------------------------------------
+           MODE
+           ---------------------------------------------------- */
+
+        if (
+          msg.type === "mode"
+        ) {
+
+          mode =
+            normalizeMode(
+              msg.mode
+            );
+
+
+          log(
+            "ACURA MODE ->",
+            mode
+          );
+
+
+          sendTune();
+
+          return;
+        }
+
+
+        /* ----------------------------------------------------
+           BANDWIDTH
+           ---------------------------------------------------- */
+
+        if (
+          msg.type === "bandwidth" ||
+          msg.bandwidthLow !==
+            undefined ||
+          msg.bandwidthHigh !==
+            undefined
+        ) {
+
+          if (
+            upstream &&
+            upstream.readyState ===
+              WebSocket.OPEN
+          ) {
+
+            try {
+
+              upstream.send(
+                JSON.stringify({
+                  type: "tune",
+
+                  bandwidthLow:
+                    Number(
+                      msg.bandwidthLow ??
+                      msg.low ??
+                      -2700
+                    ),
+
+                  bandwidthHigh:
+                    Number(
+                      msg.bandwidthHigh ??
+                      msg.high ??
+                      2700
+                    )
+                })
+              );
+
+            }
+
+            catch {}
+
+          }
+
+
+          return;
+        }
+
+
+        /* ----------------------------------------------------
+           OTHER COMMANDS
+           ---------------------------------------------------- */
+
+        if (
+          upstream &&
+          upstream.readyState ===
+            WebSocket.OPEN
+        ) {
+
+          try {
+
+            upstream.send(
+              JSON.stringify(msg)
+            );
+
+          }
+
+          catch {}
+
+        }
+
+      }
     );
 
-    if (browser.readyState === WebSocket.OPEN) {
 
-      browser.send(JSON.stringify({
-        type: "error",
-        message: error.message
-      }));
-    }
+    /* ========================================================
+       BROWSER CLOSED
+       ======================================================== */
 
-  });
+    browser.on(
+      "close",
+      () => {
 
-
-  kiwi.on("close", () => {
-
-    console.log("Kiwi disconnected");
-
-    if (keepalive) {
-      clearInterval(keepalive);
-    }
-
-    if (browser.readyState === WebSocket.OPEN) {
-
-      browser.send(JSON.stringify({
-        type: "kiwi",
-        status: "disconnected"
-      }));
-    }
-
-  });
+        closed = true;
 
 
-  browser.on("close", () => {
+        if (reconnectTimer) {
 
-    console.log("ACURA visitor disconnected");
+          clearTimeout(
+            reconnectTimer
+          );
 
-    if (keepalive) {
-      clearInterval(keepalive);
-    }
-
-    try {
-      kiwi.close();
-    } catch (_) {}
-
-  });
-
-});
+        }
 
 
-/* =========================================================
-   START
-========================================================= */
+        if (upstream) {
+
+          try {
+            upstream.close();
+          }
+
+          catch {}
+
+
+          upstream = null;
+
+        }
+
+
+        log(
+          "ACURA SDR visitor disconnected"
+        );
+
+      }
+    );
+
+
+    browser.on(
+      "error",
+      err => {
+
+        log(
+          "ACURA BROWSER ERROR:",
+          err.message
+        );
+
+      }
+    );
+
+
+    sendBrowser({
+      type: "bridge",
+      status: "ready",
+      protocol: "UberSDR V2"
+    });
+
+
+    /*
+     * ========================================================
+     * CRITICAL FIX
+     *
+     * START UBERSDR IMMEDIATELY.
+     *
+     * The ACURA webpage does NOT send a separate
+     * "connect" message before its first tune.
+     *
+     * Previous version waited forever.
+     * ========================================================
+     */
+
+    connectUpstream();
+
+  }
+);
+
+
+/* ============================================================
+   STATUS PAGE
+   ============================================================ */
+
+app.get(
+  "/",
+  (req, res) => {
+
+    res
+      .type("text/plain")
+      .send(
+`ACURA DX-1000 SDR BRIDGE
+STATUS: ONLINE
+UPSTREAM: ${httpBase()}
+PROTOCOL: UberSDR V2
+SESSION: POST /connection
+AUDIO: /ws
+FORMAT: OPUS
+BROWSER: /sdr
+`
+      );
+
+  }
+);
+
+
+app.get(
+  "/health",
+  (req, res) => {
+
+    res.json({
+      ok: true,
+
+      bridge:
+        "ACURA DX-1000",
+
+      upstream:
+        httpBase(),
+
+      protocol:
+        "UberSDR V2",
+
+      session:
+        "/connection",
+
+      audio:
+        "/ws",
+
+      browser:
+        "/sdr"
+    });
+
+  }
+);
+
+
+/* ============================================================
+   START SERVER
+   ============================================================ */
 
 server.listen(
   PORT,
@@ -569,13 +1482,51 @@ server.listen(
   () => {
 
     console.log("");
-    console.log("===============================");
-    console.log(" ACURA DX-1000 SDR BRIDGE");
-    console.log("===============================");
-    console.log(`Port: ${PORT}`);
-    console.log(`Kiwi: ${KIWI_URL || "NOT SET"}`);
-    console.log("Live browser socket: /sdr");
-    console.log("===============================");
+
+    console.log(
+      "================================"
+    );
+
+    console.log(
+      "ACURA DX-1000 SDR BRIDGE"
+    );
+
+    console.log(
+      "================================"
+    );
+
+    console.log(
+      `Port: ${PORT}`
+    );
+
+    console.log(
+      "Browser socket: /sdr"
+    );
+
+    console.log(
+      "Session: POST /connection"
+    );
+
+    console.log(
+      "Audio socket: /ws"
+    );
+
+    console.log(
+      "Protocol: UberSDR V2"
+    );
+
+    console.log(
+      "AUTO-UPSTREAM START: ENABLED"
+    );
+
+    console.log(
+      `Upstream: ${httpBase()}`
+    );
+
+    console.log(
+      "================================"
+    );
+
     console.log("");
 
   }
