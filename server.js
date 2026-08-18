@@ -1,588 +1,1000 @@
+"use strict";
+
+/*
+ * ACURA SDR BRIDGE
+ * VibeSDR / UberSDR native audio-WebSocket protocol
+ *
+ * Extracted from VibePowerModule.swift.
+ *
+ * Browser:
+ *      wss://YOUR-RAILWAY-HOST/sdr
+ *
+ * Upstream audio:
+ *      /ws
+ *      ?user_session_id=...
+ *      &frequency=...
+ *      &mode=...
+ *      &format=opus
+ *      &version=2
+ *
+ * Tune:
+ *      {"type":"tune","frequency":14250000,"mode":"usb"}
+ *
+ * Binary audio packet:
+ *
+ *   0..7     uint64 LE   timestamp
+ *   8..11    uint32 LE   sample rate
+ *   12       uint8       channels
+ *   13..16   float32 LE  baseband power
+ *   17..20   float32 LE  noise density
+ *   21..     Opus payload
+ */
+
 const express = require("express");
 const http = require("http");
 const WebSocket = require("ws");
+const crypto = require("crypto");
+
+const PORT = Number(process.env.PORT || 8080);
+
+/*
+ * Set this in Railway to the actual UberSDR/VibeSDR server.
+ *
+ * Examples:
+ *
+ * https://example.com
+ * http://example.com:8073
+ *
+ * DO NOT put /ws on the end.
+ */
+const UPSTREAM_URL =
+  process.env.UPSTREAM_URL ||
+  process.env.UBERSDR_URL ||
+  "";
+
+/*
+ * Optional upstream credentials.
+ */
+const UPSTREAM_PASSWORD =
+  process.env.UPSTREAM_PASSWORD || "";
+
+const VS_ADMIN_TICKET =
+  process.env.VS_ADMIN_TICKET || "";
+
+const VS_ADMIN_NONCE =
+  process.env.VS_ADMIN_NONCE || "";
+
+const VS_ADMIN_AUTH =
+  process.env.VS_ADMIN_AUTH || "";
+
+
+/* ============================================================
+   EXPRESS
+   ============================================================ */
 
 const app = express();
-const server = http.createServer(app);
-
-const PORT = process.env.PORT || 3000;
-const KIWI_URL = process.env.KIWI_URL || "";
-
-app.use(express.json());
-
-app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-
-  if (req.method === "OPTIONS") {
-    return res.sendStatus(204);
-  }
-
-  next();
-});
-
-
-/* =========================================================
-   ACURA DX-1000 BRIDGE HOME
-========================================================= */
 
 app.get("/", (req, res) => {
-  res.type("html").send(`
-<!doctype html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>ACURA DX-1000 SDR Bridge</title>
-<style>
-body{
-  margin:0;
-  background:#020b11;
-  color:#55eaff;
-  font-family:Arial,sans-serif;
-  text-align:center;
-  padding:70px 20px;
-}
-h1{
-  letter-spacing:4px;
-  text-shadow:0 0 18px #00d9ff;
-}
-.box{
-  max-width:650px;
-  margin:35px auto;
-  padding:28px;
-  border:1px solid #0d6274;
-  border-radius:14px;
-  background:#06141d;
-}
-.ok{color:#65ff91;}
-</style>
-</head>
-<body>
-<h1>ACURA DX-1000</h1>
-<h2>LIVE HF SDR BRIDGE</h2>
-
-<div class="box">
-<h3 class="ok">● SERVER ONLINE</h3>
-<p>Atlantic Coast United Radio Association</p>
-<p>Live KiwiSDR Gateway</p>
-</div>
-</body>
-</html>
-  `);
+  res.type("text/plain").send(
+`ACURA DX-1000 SDR BRIDGE
+STATUS: ONLINE
+PROTOCOL: VibeSDR / UberSDR V2
+AUDIO: OPUS
+WEBSOCKET: /sdr
+`
+  );
 });
-
-
-/* =========================================================
-   HEALTH
-========================================================= */
 
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
-    service: "ACURA DX-1000 SDR Bridge",
-    kiwiConfigured: Boolean(KIWI_URL),
-    time: new Date().toISOString()
+    bridge: "ACURA DX-1000",
+    protocol: "VibeSDR-v2",
+    audio: "opus",
+    upstreamConfigured: Boolean(UPSTREAM_URL)
   });
 });
 
+const server = http.createServer(app);
 
-/* =========================================================
-   STATUS
-========================================================= */
 
-app.get("/api/status", (req, res) => {
-  res.json({
-    online: true,
-    kiwiConfigured: Boolean(KIWI_URL),
-    kiwiUrl: KIWI_URL || null,
-    system: "ACURA DX-1000",
-    mode: "RX ONLY"
-  });
+/* ============================================================
+   BROWSER WEBSOCKET
+   ============================================================ */
+
+const browserWss = new WebSocket.Server({
+  noServer: true,
+  perMessageDeflate: false
 });
 
+server.on("upgrade", (req, socket, head) => {
 
-/* =========================================================
-   BASIC KIWI HTTP TEST
-========================================================= */
-
-app.get("/api/kiwi-test", async (req, res) => {
-
-  if (!KIWI_URL) {
-    return res.status(500).json({
-      ok: false,
-      error: "KIWI_URL not configured"
-    });
-  }
+  let pathname;
 
   try {
-
-    const response = await fetch(KIWI_URL, {
-      signal: AbortSignal.timeout(10000)
-    });
-
-    res.json({
-      ok: true,
-      reachable: response.ok,
-      status: response.status,
-      statusText: response.statusText
-    });
-
-  } catch (error) {
-
-    res.status(502).json({
-      ok: false,
-      reachable: false,
-      error: error.message
-    });
-
+    pathname = new URL(
+      req.url,
+      `http://${req.headers.host || "localhost"}`
+    ).pathname;
+  } catch {
+    socket.destroy();
+    return;
   }
+
+  if (pathname !== "/sdr") {
+    socket.destroy();
+    return;
+  }
+
+  browserWss.handleUpgrade(req, socket, head, ws => {
+    browserWss.emit("connection", ws, req);
+  });
 });
 
 
-/* =========================================================
-   KIWI WEBSOCKET TEST
-========================================================= */
-
-app.get("/api/kiwi-ws-test", (req, res) => {
-
-  if (!KIWI_URL) {
-    return res.status(500).json({
-      ok: false,
-      error: "KIWI_URL not configured"
-    });
-  }
-
-  const parsed = new URL(KIWI_URL);
-
-  const wsProtocol =
-    parsed.protocol === "https:" ? "wss:" : "ws:";
-
-  const stamp = Math.floor(Date.now() / 1000);
-
-  const wsUrl =
-    `${wsProtocol}//${parsed.host}/${stamp}/SND`;
-
-  let finished = false;
-
-  const kiwi = new WebSocket(wsUrl, {
-    handshakeTimeout: 10000
-  });
-
-  const finish = (code, data) => {
-
-    if (finished) return;
-
-    finished = true;
-
-    try {
-      kiwi.close();
-    } catch (_) {}
-
-    res.status(code).json(data);
-  };
-
-  const timer = setTimeout(() => {
-
-    finish(504, {
-      ok: false,
-      error: "Kiwi WebSocket timeout"
-    });
-
-  }, 12000);
-
-  kiwi.on("open", () => {
-    kiwi.send("SET auth t=kiwi p=");
-  });
-
-  kiwi.on("message", (data) => {
-
-    clearTimeout(timer);
-
-    const packet = Buffer.from(data);
-
-    finish(200, {
-      ok: true,
-      websocketConnected: true,
-      firstMessageTag:
-        packet.subarray(0, 3).toString("ascii"),
-      messageBytes: packet.length
-    });
-
-  });
-
-  kiwi.on("error", (error) => {
-
-    clearTimeout(timer);
-
-    finish(502, {
-      ok: false,
-      websocketConnected: false,
-      error: error.message
-    });
-
-  });
-
-});
-
-
-/* =========================================================
-   RECEIVER HELPERS
-========================================================= */
-
-const filters = {
-
-  usb: [300, 2700],
-  lsb: [-2700, -300],
-  am: [-4900, 4900],
-  cw: [300, 700]
-
-};
-
+/* ============================================================
+   HELPERS
+   ============================================================ */
 
 function normalizeMode(mode) {
 
-  mode =
-    String(mode || "usb").toLowerCase();
+  mode = String(mode || "usb").toLowerCase();
 
-  return filters[mode] ? mode : "usb";
+  const allowed = new Set([
+    "usb",
+    "lsb",
+    "am",
+    "fm",
+    "nfm",
+    "wfm",
+    "cw",
+    "cwu",
+    "cwl",
+    "sam"
+  ]);
+
+  return allowed.has(mode) ? mode : "usb";
 }
 
 
-function normalizeFrequency(value) {
+function normalizeFrequency(freq) {
 
-  let f = Number(value);
+  const n = Number(freq);
 
-  if (!Number.isFinite(f)) {
-    return 14250;
-  }
+  if (!Number.isFinite(n))
+    return 14250000;
 
-  /* Hz -> kHz */
-  if (f > 100000) {
-    f /= 1000;
-  }
+  return Math.max(1, Math.round(n));
+}
 
-  return Math.min(
-    30000,
-    Math.max(10, f)
+
+function makeSessionId() {
+
+  if (typeof crypto.randomUUID === "function")
+    return crypto.randomUUID();
+
+  return crypto.randomBytes(16).toString("hex");
+}
+
+
+function websocketBase(base) {
+
+  let s = String(base || "").trim();
+
+  if (!s)
+    return "";
+
+  s = s.replace(/\/+$/, "");
+
+  if (s.startsWith("https://"))
+    return "wss://" + s.slice(8);
+
+  if (s.startsWith("http://"))
+    return "ws://" + s.slice(7);
+
+  if (s.startsWith("wss://") ||
+      s.startsWith("ws://"))
+    return s;
+
+  return "wss://" + s;
+}
+
+
+/*
+ * This reproduces VibePowerModule.audioWsURL().
+ */
+function buildAudioUrl({
+  frequency,
+  mode,
+  uuid
+}) {
+
+  const base = websocketBase(UPSTREAM_URL);
+
+  if (!base)
+    return null;
+
+  const u = new URL(base + "/ws");
+
+  u.searchParams.set(
+    "user_session_id",
+    uuid
   );
-}
 
-
-function makeTuneCommand(frequency, mode) {
-
-  const m = normalizeMode(mode);
-  const f = normalizeFrequency(frequency);
-  const [low, high] = filters[m];
-
-  return (
-    `SET mod=${m}` +
-    ` low_cut=${low}` +
-    ` high_cut=${high}` +
-    ` freq=${f.toFixed(3)}`
+  u.searchParams.set(
+    "frequency",
+    String(frequency)
   );
-}
 
+  u.searchParams.set(
+    "mode",
+    mode
+  );
 
-/* =========================================================
-   LIVE ACURA SDR SOCKET
+  u.searchParams.set(
+    "format",
+    "opus"
+  );
 
-   WordPress will connect to:
+  u.searchParams.set(
+    "version",
+    "2"
+  );
 
-   wss://acura-sdr-bridge-production.up.railway.app/sdr
-========================================================= */
+  /*
+   * VibePowerModule identifies itself through
+   * the client query parameter.
+   */
+  u.searchParams.set(
+    "client",
+    "ACURA-SDR-Bridge/1.0"
+  );
 
-const wss = new WebSocket.Server({
-  server,
-  path: "/sdr"
-});
-
-
-wss.on("connection", (browser) => {
-
-  console.log("ACURA SDR visitor connected");
-
-  if (!KIWI_URL) {
-
-    browser.send(JSON.stringify({
-      type: "error",
-      message: "KIWI_URL not configured"
-    }));
-
-    return browser.close();
+  /*
+   * Bypass password.
+   */
+  if (UPSTREAM_PASSWORD) {
+    u.searchParams.set(
+      "password",
+      UPSTREAM_PASSWORD
+    );
   }
 
+  /*
+   * Owner/admin authentication.
+   *
+   * VibePowerModule supports either:
+   *
+   * vs_admin_ticket
+   *
+   * OR
+   *
+   * vs_admin_nonce + vs_admin_auth
+   */
 
-  const parsed = new URL(KIWI_URL);
+  if (VS_ADMIN_TICKET) {
 
-  const wsProtocol =
-    parsed.protocol === "https:" ? "wss:" : "ws:";
+    u.searchParams.set(
+      "vs_admin_ticket",
+      VS_ADMIN_TICKET
+    );
 
-  const stamp = Math.floor(Date.now() / 1000);
+  } else {
 
-  const kiwiWsUrl =
-  `${wsProtocol}//${parsed.host}/${stamp}/SND`;
+    if (VS_ADMIN_NONCE) {
+      u.searchParams.set(
+        "vs_admin_nonce",
+        VS_ADMIN_NONCE
+      );
+    }
 
-
-  let frequency = 14250;
-  let mode = "usb";
-  let configured = false;
-  let keepalive = null;
-
-
-  browser.send(JSON.stringify({
-    type: "bridge",
-    status: "connecting",
-    receiver: parsed.host
-  }));
-
-
-  const kiwi = new WebSocket(kiwiWsUrl, {
-    handshakeTimeout: 10000
-  });
-
-
-  function sendKiwi(command) {
-
-    if (kiwi.readyState === WebSocket.OPEN) {
-      kiwi.send(command);
+    if (VS_ADMIN_AUTH) {
+      u.searchParams.set(
+        "vs_admin_auth",
+        VS_ADMIN_AUTH
+      );
     }
   }
 
-
-  function configureKiwi() {
-
-    if (configured) return;
-
-    configured = true;
-sendKiwi("SET AR OK in=12000 out=44100");
-    sendKiwi("SET ident_user=ACURA-DX");
-
-    sendKiwi(
-      makeTuneCommand(frequency, mode)
-    );
-
-    sendKiwi(
-      "SET agc=1 hang=0 thresh=-100 slope=6 decay=1000 manGain=50"
-    );
-
-    sendKiwi("SET compression=0");
-
-    sendKiwi("SET squelch=0 max=0");
-
-    sendKiwi("SET keepalive");
-
-    keepalive = setInterval(() => {
-      sendKiwi("SET keepalive");
-    }, 5000);
+  return u.toString();
+}
 
 
-    browser.send(JSON.stringify({
-      type: "receiver",
-      status: "live",
-      frequency,
-      mode
-    }));
+/* ============================================================
+   PACKET VALIDATION
+
+   VibePowerModule V2:
+
+   byte 0-7:
+       timestamp uint64 LE
+
+   byte 8-11:
+       sample rate uint32 LE
+
+   byte 12:
+       channels
+
+   byte 13-16:
+       baseband power float32 LE
+
+   byte 17-20:
+       noise density float32 LE
+
+   byte 21+:
+       Opus
+   ============================================================ */
+
+function inspectAudioPacket(buffer) {
+
+  if (!Buffer.isBuffer(buffer))
+    buffer = Buffer.from(buffer);
+
+  if (buffer.length <= 21)
+    return null;
+
+  const sampleRate =
+    buffer.readUInt32LE(8);
+
+  const channels =
+    buffer.readUInt8(12);
+
+  const basebandPower =
+    buffer.readFloatLE(13);
+
+  const noiseDensity =
+    buffer.readFloatLE(17);
+
+  if (
+    sampleRate < 8000 ||
+    sampleRate > 96000
+  ) {
+    return null;
   }
 
+  if (
+    channels !== 1 &&
+    channels !== 2
+  ) {
+    return null;
+  }
 
-kiwi.on("open", () => {
+  if (buffer.length - 21 < 3)
+    return null;
 
-  console.log("Kiwi SND socket connected");
-
-  sendKiwi("SET auth t=kiwi p=");
-
-  setTimeout(() => {
-    console.log("Starting Kiwi audio configuration");
-    configureKiwi();
-  }, 500);
-
-  browser.send(JSON.stringify({
-    type: "kiwi",
-    status: "connected"
-  }));
-});
-  });
-
-
-  kiwi.on("message", (data) => {
-
-    const packet = Buffer.from(data);
-
-    if (packet.length < 3) return;
-
-    const tag =
-      packet.subarray(0, 3).toString("ascii");
+  return {
+    sampleRate,
+    channels,
+    basebandPower,
+    noiseDensity,
+    opusBytes: buffer.length - 21
+  };
+}
 
 
-    /* Kiwi setup messages */
+/* ============================================================
+   CLIENT SESSION
+   ============================================================ */
 
-    if (tag === "MSG") {
+browserWss.on(
+  "connection",
+  (browser, req) => {
 
-      const text =
-        packet.subarray(4).toString("utf8");
+    console.log(
+      "ACURA SDR visitor connected"
+    );
 
+    let upstream = null;
+
+    let closed = false;
+
+    let frequency = 14250000;
+
+    let mode = "usb";
+
+    let sessionId =
+      makeSessionId();
+
+    let reconnectTimer = null;
+
+    let firstAudioPacket = true;
+
+    let packetCount = 0;
+
+    let lastSampleRate = 0;
+
+
+    function sendBrowser(obj) {
 
       if (
-        text.includes("sample_rate=") ||
-        text.includes("audio_rate=")
-      ) {
+        browser.readyState !==
+        WebSocket.OPEN
+      )
+        return;
 
-        configureKiwi();
-      }
-
-
-      if (browser.readyState === WebSocket.OPEN) {
-
-        browser.send(JSON.stringify({
-          type: "kiwi-msg",
-          value: text
-        }));
-      }
-
-      return;
-    }
-
-
-    /* Real Kiwi received audio packet */
-
-    if (tag === "SND") {
-
-      if (browser.readyState === WebSocket.OPEN) {
-
-        browser.send(packet, {
-          binary: true
-        });
-      }
-
-      return;
-    }
-
-  });
-
-
-  /* Commands from ACURA radio */
-
-  browser.on("message", (data, isBinary) => {
-
-    if (isBinary) return;
-
-    let message;
-
-    try {
-      message =
-        JSON.parse(data.toString());
-    } catch (_) {
-      return;
-    }
-
-
-    if (message.type === "tune") {
-
-      frequency =
-        normalizeFrequency(message.frequency);
-
-      mode =
-        normalizeMode(message.mode || mode);
-
-      sendKiwi(
-        makeTuneCommand(frequency, mode)
+      browser.send(
+        JSON.stringify(obj)
       );
+    }
 
 
-      browser.send(JSON.stringify({
-        type: "tuned",
+    function sendTune() {
+
+      if (
+        !upstream ||
+        upstream.readyState !==
+        WebSocket.OPEN
+      )
+        return;
+
+      const tune = {
+        type: "tune",
         frequency,
         mode
-      }));
-    }
+      };
 
+      upstream.send(
+        JSON.stringify(tune)
+      );
 
-    if (message.type === "mode") {
-
-      mode =
-        normalizeMode(message.mode);
-
-      sendKiwi(
-        makeTuneCommand(frequency, mode)
+      console.log(
+        `Tune -> ${frequency} ${mode}`
       );
     }
 
-  });
+
+    function disconnectUpstream() {
+
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+
+      if (upstream) {
+
+        upstream.removeAllListeners();
+
+        try {
+          upstream.close();
+        } catch {}
+
+        try {
+          upstream.terminate();
+        } catch {}
+
+        upstream = null;
+      }
+    }
 
 
-  kiwi.on("error", (error) => {
+    function scheduleReconnect() {
 
-    console.error(
-      "Kiwi error:",
-      error.message
+      if (closed)
+        return;
+
+      if (reconnectTimer)
+        return;
+
+      reconnectTimer =
+        setTimeout(() => {
+
+          reconnectTimer = null;
+
+          if (!closed)
+            connectUpstream();
+
+        }, 2000);
+    }
+
+
+    function connectUpstream() {
+
+      if (closed)
+        return;
+
+      disconnectUpstream();
+
+      if (!UPSTREAM_URL) {
+
+        console.error(
+          "UPSTREAM_URL is not configured"
+        );
+
+        sendBrowser({
+          type: "error",
+          message:
+            "Railway UPSTREAM_URL is not configured"
+        });
+
+        return;
+      }
+
+      const audioUrl =
+        buildAudioUrl({
+          frequency,
+          mode,
+          uuid: sessionId
+        });
+
+      if (!audioUrl) {
+
+        sendBrowser({
+          type: "error",
+          message:
+            "Could not build upstream WebSocket URL"
+        });
+
+        return;
+      }
+
+      /*
+       * Do not print passwords/admin credentials.
+       */
+      console.log(
+        "Opening VibeSDR audio WebSocket"
+      );
+
+      console.log(
+        `Frequency: ${frequency}`
+      );
+
+      console.log(
+        `Mode: ${mode}`
+      );
+
+      console.log(
+        `Session: ${sessionId}`
+      );
+
+      firstAudioPacket = true;
+
+      packetCount = 0;
+
+      lastSampleRate = 0;
+
+
+      upstream =
+        new WebSocket(audioUrl, {
+          perMessageDeflate: false,
+          handshakeTimeout: 10000
+        });
+
+
+      upstream.binaryType =
+        "nodebuffer";
+
+
+      upstream.on(
+        "open",
+        () => {
+
+          console.log(
+            "VibeSDR audio socket connected"
+          );
+
+          sendBrowser({
+            type: "upstream",
+            status: "connected",
+            frequency,
+            mode
+          });
+
+          /*
+           * IMPORTANT:
+           *
+           * VibePowerModule does NOT send a
+           * separate authentication handshake.
+           *
+           * Authentication and initial tuning
+           * are already in the WS URL.
+           *
+           * The tune command is reasserted
+           * after audio begins.
+           */
+        }
+      );
+
+
+      upstream.on(
+        "message",
+        (data, isBinary) => {
+
+          if (closed)
+            return;
+
+
+          /* -------------------------------
+             TEXT MESSAGE
+             ------------------------------- */
+
+          if (!isBinary) {
+
+            const text =
+              data.toString();
+
+            console.log(
+              "VibeSDR:",
+              text.slice(0, 500)
+            );
+
+            /*
+             * Pass server status/DSP text
+             * directly to our browser.
+             */
+
+            if (
+              browser.readyState ===
+              WebSocket.OPEN
+            ) {
+              browser.send(text);
+            }
+
+            return;
+          }
+
+
+          /* -------------------------------
+             AUDIO PACKET
+             ------------------------------- */
+
+          const packet =
+            Buffer.isBuffer(data)
+              ? data
+              : Buffer.from(data);
+
+          const info =
+            inspectAudioPacket(packet);
+
+          if (!info) {
+
+            console.log(
+              "Rejected invalid V2 packet:",
+              packet.length
+            );
+
+            return;
+          }
+
+          packetCount++;
+
+
+          /*
+           * VibePowerModule reasserts the
+           * requested tune after receiving
+           * the FIRST audio packet.
+           */
+
+          if (firstAudioPacket) {
+
+            firstAudioPacket = false;
+
+            console.log(
+              "First valid V2 audio packet received"
+            );
+
+            console.log(
+              `Audio: ${info.sampleRate} Hz / ${info.channels} channel(s)`
+            );
+
+            sendTune();
+          }
+
+
+          /*
+           * VibePowerModule detects a sample
+           * rate change because the upstream
+           * Opus encoder may have been created
+           * for the old mode/rate.
+           */
+
+          if (
+            lastSampleRate &&
+            lastSampleRate !==
+              info.sampleRate
+          ) {
+
+            console.log(
+              `Audio sample rate changed: ${lastSampleRate} -> ${info.sampleRate}`
+            );
+          }
+
+          lastSampleRate =
+            info.sampleRate;
+
+
+          /*
+           * MOST IMPORTANT PART:
+           *
+           * DO NOT strip the 21-byte header.
+           *
+           * The client expects the complete
+           * VibeSDR V2 binary packet.
+           */
+
+          if (
+            browser.readyState ===
+            WebSocket.OPEN
+          ) {
+
+            browser.send(packet, {
+              binary: true
+            });
+          }
+
+
+          if (
+            packetCount <= 3 ||
+            packetCount % 500 === 0
+          ) {
+
+            console.log(
+              `Audio packet #${packetCount} ` +
+              `${packet.length} bytes ` +
+              `${info.sampleRate}Hz ` +
+              `${info.channels}ch ` +
+              `Opus=${info.opusBytes}`
+            );
+          }
+        }
+      );
+
+
+      upstream.on(
+        "ping",
+        data => {
+
+          try {
+            upstream.pong(data);
+          } catch {}
+        }
+      );
+
+
+      upstream.on(
+        "error",
+        err => {
+
+          console.error(
+            "VibeSDR WebSocket error:",
+            err.message
+          );
+        }
+      );
+
+
+      upstream.on(
+        "close",
+        (code, reason) => {
+
+          if (closed)
+            return;
+
+          console.log(
+            `VibeSDR disconnected: ${code} ${reason || ""}`
+          );
+
+          sendBrowser({
+            type: "upstream",
+            status: "disconnected"
+          });
+
+          upstream = null;
+
+          scheduleReconnect();
+        }
+      );
+    }
+
+
+    /* ========================================================
+       COMMANDS FROM ACURA WEB PAGE
+       ======================================================== */
+
+    browser.on(
+      "message",
+      (raw, isBinary) => {
+
+        if (isBinary)
+          return;
+
+        let msg;
+
+        try {
+
+          msg =
+            JSON.parse(
+              raw.toString()
+            );
+
+        } catch {
+
+          console.log(
+            "Ignored non-JSON browser command"
+          );
+
+          return;
+        }
+
+
+        /* -------------------------------
+           CONNECT / POWER ON
+           ------------------------------- */
+
+        if (
+          msg.type === "connect" ||
+          msg.type === "start" ||
+          msg.type === "power"
+        ) {
+
+          if (
+            msg.frequency !== undefined
+          ) {
+            frequency =
+              normalizeFrequency(
+                msg.frequency
+              );
+          }
+
+          if (msg.mode) {
+            mode =
+              normalizeMode(
+                msg.mode
+              );
+          }
+
+          /*
+           * New radio power-on =
+           * new session.
+           */
+
+          sessionId =
+            makeSessionId();
+
+          connectUpstream();
+
+          return;
+        }
+
+
+        /* -------------------------------
+           TUNE
+           ------------------------------- */
+
+        if (
+          msg.type === "tune"
+        ) {
+
+          if (
+            msg.frequency !== undefined
+          ) {
+            frequency =
+              normalizeFrequency(
+                msg.frequency
+              );
+          }
+
+          if (msg.mode) {
+            mode =
+              normalizeMode(
+                msg.mode
+              );
+          }
+
+          sendTune();
+
+          return;
+        }
+
+
+        /* -------------------------------
+           BANDWIDTH / DSP / ETC.
+
+           VibePowerModule forwards these
+           as JSON text over the SAME audio
+           WebSocket.
+           ------------------------------- */
+
+        if (
+          upstream &&
+          upstream.readyState ===
+            WebSocket.OPEN
+        ) {
+
+          upstream.send(
+            JSON.stringify(msg)
+          );
+        }
+      }
     );
 
-    if (browser.readyState === WebSocket.OPEN) {
 
-      browser.send(JSON.stringify({
-        type: "error",
-        message: error.message
-      }));
-    }
+    browser.on(
+      "close",
+      () => {
 
-  });
+        closed = true;
 
+        console.log(
+          "ACURA SDR visitor disconnected"
+        );
 
-  kiwi.on("close", () => {
-
-    console.log("Kiwi disconnected");
-
-    if (keepalive) {
-      clearInterval(keepalive);
-    }
-
-    if (browser.readyState === WebSocket.OPEN) {
-
-      browser.send(JSON.stringify({
-        type: "kiwi",
-        status: "disconnected"
-      }));
-    }
-
-  });
+        disconnectUpstream();
+      }
+    );
 
 
-  browser.on("close", () => {
+    browser.on(
+      "error",
+      err => {
 
-    console.log("ACURA visitor disconnected");
-
-    if (keepalive) {
-      clearInterval(keepalive);
-    }
-
-    try {
-      kiwi.close();
-    } catch (_) {}
-
-  });
-
-});
+        console.error(
+          "Browser WebSocket error:",
+          err.message
+        );
+      }
+    );
 
 
-/* =========================================================
+    /*
+     * Tell the ACURA page the bridge itself
+     * is alive.
+     */
+
+    sendBrowser({
+      type: "bridge",
+      status: "ready",
+      protocol: "VibeSDR-v2"
+    });
+  }
+);
+
+
+/* ============================================================
    START
-========================================================= */
+   ============================================================ */
 
 server.listen(
   PORT,
   "0.0.0.0",
   () => {
 
-    console.log("");
-    console.log("===============================");
-    console.log(" ACURA DX-1000 SDR BRIDGE");
-    console.log("===============================");
-    console.log(`Port: ${PORT}`);
-    console.log(`Kiwi: ${KIWI_URL || "NOT SET"}`);
-    console.log("Live browser socket: /sdr");
-    console.log("===============================");
-    console.log("");
+    console.log(
+      "================================"
+    );
 
+    console.log(
+      "ACURA DX-1000 SDR BRIDGE"
+    );
+
+    console.log(
+      "================================"
+    );
+
+    console.log(
+      `Port: ${PORT}`
+    );
+
+    console.log(
+      "Browser socket: /sdr"
+    );
+
+    console.log(
+      "Protocol: VibeSDR / UberSDR V2"
+    );
+
+    console.log(
+      "Audio: Opus + 21-byte V2 header"
+    );
+
+    console.log(
+      `Upstream: ${
+        UPSTREAM_URL
+          ? "CONFIGURED"
+          : "NOT CONFIGURED"
+      }`
+    );
+
+    console.log(
+      "================================"
+    );
   }
 );
