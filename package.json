@@ -1,7 +1,7 @@
 {
   "name": "acura-sdr-bridge",
-  "version": "1.0.0",
-  "description": "ACURA live KiwiSDR bridge for the DX Propagation page",
+  "version": "2.0.0",
+  "description": "ACURA DX-1000 UberSDR live audio bridge",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
@@ -11,6 +11,7 @@
   },
   "dependencies": {
     "express": "^5.1.0",
-    "ws": "^8.18.3"
+    "ws": "^8.18.3",
+    "opusscript": "^0.1.1"
   }
 }
