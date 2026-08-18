@@ -1,1056 +1,627 @@
-'use strict';
+"use strict";
 
-const express = require('express');
-const http = require('http');
-const WebSocket = require('ws');
+const express = require("express");
+const http = require("http");
+const WebSocket = require("ws");
+const crypto = require("crypto");
 
 const app = express();
 const server = http.createServer(app);
+const browserWss = new WebSocket.Server({ noServer: true });
 
-const PORT = Number(process.env.PORT || 8080);
+const PORT = process.env.PORT || 8080;
 
 /*
- * ============================================================
- * ACURA DX-1000 SDR BRIDGE
- * Browser <-> Railway <-> VibeSDR / UberSDR
- * ============================================================
+ * IMPORTANT:
  *
- * Browser WebSocket:
- *   /sdr
+ * VibePowerModule.swift confirms UberSDR/VibeSDR audio uses:
  *
- * Browser sends frequency in MHz or Hz.
- * Bridge normalizes it to Hz before sending upstream.
+ *   /ws
  *
- * Upstream audio:
- *   VibeSDR / UberSDR V2
- *   Opus packets with V2 header
- * ============================================================
+ * NOT:
+ *
+ *   /ws/audio
+ *
+ * Connection format:
+ *
+ * /ws?user_session_id=UUID
+ *    &frequency=Hz
+ *    &mode=usb
+ *    &format=opus
+ *    &version=2
+ *    &client=...
+ *
+ * Binary packet format:
+ *
+ * bytes  0-7   uint64 LE timestamp
+ * bytes  8-11  uint32 LE sample rate
+ * byte   12    channels
+ * bytes 13-16  float32 LE baseband power
+ * bytes 17-20  float32 LE noise density
+ * bytes 21+    Opus payload
+ *
+ * Tuning command:
+ *
+ * {"type":"tune","frequency":14250000,"mode":"usb"}
  */
 
-const UPSTREAM =
-  process.env.UBERSDR_URL ||
-  process.env.VIBESDR_URL ||
-  process.env.UPSTREAM_URL ||
-  '';
+const UPSTREAM_BASE =
+  process.env.UPSTREAM_BASE ||
+  process.env.UBERSDR_BASE ||
+  "https://ubersdr.k3fef.com";
 
 const UPSTREAM_PASSWORD =
-  process.env.UBERSDR_PASSWORD ||
-  process.env.VIBESDR_PASSWORD ||
   process.env.UPSTREAM_PASSWORD ||
-  '';
+  process.env.UBERSDR_PASSWORD ||
+  "";
 
-const UPSTREAM_UUID =
-  process.env.UBERSDR_UUID ||
-  process.env.VIBESDR_UUID ||
-  process.env.UPSTREAM_UUID ||
-  'acura-dx1000';
-
-const DEFAULT_FREQ = 7255000;
-const DEFAULT_MODE = 'lsb';
-
-const browserClients = new Set();
-
-let upstream = null;
-let upstreamReady = false;
-let upstreamConnecting = false;
-let reconnectTimer = null;
-let reconnectDelay = 1000;
-
-let currentFreq = DEFAULT_FREQ;
-let currentMode = DEFAULT_MODE;
-
-let audioPackets = 0;
-let audioBytes = 0;
-let lastAudioAt = 0;
-let lastUpstreamMessageAt = 0;
-
-
-/* ============================================================
- * LOGGING
- * ============================================================
- */
+const ADMIN_SUFFIX =
+  process.env.ADMIN_SUFFIX ||
+  process.env.UBERSDR_ADMIN_SUFFIX ||
+  "";
 
 function log(...args) {
   console.log(new Date().toISOString(), ...args);
 }
 
+function wsBaseFromHttp(base) {
+  let s = String(base || "").trim().replace(/\/+$/, "");
 
-/* ============================================================
- * HELPERS
- * ============================================================
- */
-
-function normalizeFrequency(value) {
-  let f = Number(value);
-
-  if (!Number.isFinite(f) || f <= 0) {
-    return currentFreq;
+  if (s.startsWith("https://")) {
+    s = "wss://" + s.slice(8);
+  } else if (s.startsWith("http://")) {
+    s = "ws://" + s.slice(7);
+  } else if (!/^wss?:\/\//i.test(s)) {
+    s = "wss://" + s;
   }
 
-  /*
-   * ACURA display normally sends MHz:
-   * 7.255 -> 7,255,000 Hz
-   *
-   * But if browser already sends Hz, leave it alone.
-   */
-  if (f < 1000) {
-    f *= 1000000;
-  }
-
-  return Math.round(f);
+  return s;
 }
-
 
 function normalizeMode(mode) {
-  const m = String(mode || '').trim().toLowerCase();
+  const m = String(mode || "usb").toLowerCase();
 
-  switch (m) {
-    case 'usb':
-    case 'lsb':
-    case 'am':
-    case 'fm':
-    case 'cw':
-    case 'cwu':
-    case 'cwl':
-      return m;
+  const allowed = new Set([
+    "usb",
+    "lsb",
+    "am",
+    "fm",
+    "nfm",
+    "cw",
+    "cwu",
+    "cwl"
+  ]);
 
-    default:
-      return currentMode || DEFAULT_MODE;
-  }
+  return allowed.has(m) ? m : "usb";
 }
 
+function normalizeFrequency(value) {
+  let n = Number(value);
 
-function safeSend(ws, data, options) {
-  if (!ws || ws.readyState !== WebSocket.OPEN) {
-    return false;
+  if (!Number.isFinite(n)) {
+    return 14250000;
   }
-
-  try {
-    ws.send(data, options);
-    return true;
-  } catch (err) {
-    log('WebSocket send error:', err.message);
-    return false;
-  }
-}
-
-
-function broadcastText(obj) {
-  const text =
-    typeof obj === 'string'
-      ? obj
-      : JSON.stringify(obj);
-
-  for (const ws of browserClients) {
-    safeSend(ws, text);
-  }
-}
-
-
-function broadcastBinary(buffer) {
-  for (const ws of browserClients) {
-    safeSend(ws, buffer, { binary: true });
-  }
-}
-
-
-/* ============================================================
- * UPSTREAM URL
- * ============================================================
- */
-
-function makeUpstreamUrl() {
-  if (!UPSTREAM) {
-    return '';
-  }
-
-  let url = UPSTREAM.trim();
 
   /*
-   * Allow Railway variable to contain:
+   * ACURA display may send MHz, kHz or Hz.
    *
-   * https://host
-   * http://host
-   * wss://host
-   * ws://host
+   * 14.250  -> 14250000
+   * 14250   -> 14250000
+   * 14250000 stays unchanged
    */
 
-  url = url
-    .replace(/^https:\/\//i, 'wss://')
-    .replace(/^http:\/\//i, 'ws://');
+  if (n < 1000) {
+    n *= 1_000_000;
+  } else if (n < 1_000_000) {
+    n *= 1000;
+  }
+
+  return Math.round(n);
+}
+
+function makeUuid() {
+  if (crypto.randomUUID) {
+    return crypto.randomUUID();
+  }
+
+  return crypto.randomBytes(16).toString("hex");
+}
+
+function buildUpstreamUrl(freq, mode, uuid) {
+  const base = wsBaseFromHttp(UPSTREAM_BASE);
+
+  const params = new URLSearchParams();
+
+  params.set("user_session_id", uuid);
+  params.set("frequency", String(freq));
+  params.set("mode", mode);
+  params.set("format", "opus");
+  params.set("version", "2");
 
   /*
-   * VibeSDR / UberSDR local-audio protocol uses /ws/audio.
+   * Match VibePowerModule.swift client identification.
+   */
+  params.set(
+    "client",
+    "ACURA-DX-1000/1 (+https://acurahamradio.org)"
+  );
+
+  if (UPSTREAM_PASSWORD) {
+    params.set("password", UPSTREAM_PASSWORD);
+  }
+
+  let url = `${base}/ws?${params.toString()}`;
+
+  /*
+   * VibePowerModule.swift appends the owner's admin
+   * authentication suffix directly to the query.
    *
-   * If user already supplied /ws/audio, don't add it twice.
+   * Expected forms include:
+   *
+   * &vs_admin_ticket=...
+   *
+   * or
+   *
+   * &vs_admin_nonce=...&vs_admin_auth=...
    */
 
-  if (!/\/ws\/audio(?:\?|$)/i.test(url)) {
-    url = url.replace(/\/+$/, '');
-    url += '/ws/audio';
+  if (ADMIN_SUFFIX) {
+    url += ADMIN_SUFFIX.startsWith("&")
+      ? ADMIN_SUFFIX
+      : "&" + ADMIN_SUFFIX;
   }
 
   return url;
 }
 
+app.use(express.json());
 
-/* ============================================================
- * AUTH / INITIAL HANDSHAKE
- * ============================================================
- */
+app.get("/", (req, res) => {
+  res.type("text/plain").send(
+    [
+      "ACURA DX-1000 SDR BRIDGE",
+      "STATUS: ONLINE",
+      "Protocol: VibeSDR / UberSDR V2",
+      "Browser WebSocket: /sdr",
+      "Upstream WebSocket: /ws",
+      "Audio: Opus",
+      "Packet Header: 21 bytes",
+      "Tuning: LIVE"
+    ].join("\n")
+  );
+});
 
-function sendUpstreamJSON(obj) {
-  if (
-    !upstream ||
-    upstream.readyState !== WebSocket.OPEN
-  ) {
-    return false;
-  }
+app.get("/health", (req, res) => {
+  res.json({
+    ok: true,
+    service: "ACURA DX-1000 SDR Bridge",
+    upstream: UPSTREAM_BASE,
+    protocol: "VibeSDR/UberSDR V2",
+    upstreamPath: "/ws",
+    browserPath: "/sdr"
+  });
+});
 
-  const text = JSON.stringify(obj);
+server.on("upgrade", (req, socket, head) => {
+  let pathname;
 
   try {
-    upstream.send(text);
-    return true;
-  } catch (err) {
-    log('Upstream command send failed:', err.message);
-    return false;
-  }
-}
-
-
-function sendHandshake() {
-  if (
-    !upstream ||
-    upstream.readyState !== WebSocket.OPEN
-  ) {
+    pathname = new URL(
+      req.url,
+      `http://${req.headers.host || "localhost"}`
+    ).pathname;
+  } catch {
+    socket.destroy();
     return;
   }
 
-  /*
-   * VibeSDR / UberSDR V2 hello.
-   *
-   * Keep fields explicit so servers that ignore unknown
-   * fields can still consume the values they understand.
-   */
-
-  const hello = {
-    type: 'hello',
-    protocol: 2,
-    version: 2,
-    client: 'ACURA-DX1000',
-    uuid: UPSTREAM_UUID
-  };
-
-  if (UPSTREAM_PASSWORD) {
-    hello.password = UPSTREAM_PASSWORD;
-    hello.auth = UPSTREAM_PASSWORD;
+  if (pathname !== "/sdr") {
+    socket.write("HTTP/1.1 404 Not Found\r\n\r\n");
+    socket.destroy();
+    return;
   }
 
-  sendUpstreamJSON(hello);
-
-  /*
-   * Some VibeServer builds accept auth separately.
-   */
-
-  if (UPSTREAM_PASSWORD) {
-    sendUpstreamJSON({
-      type: 'auth',
-      password: UPSTREAM_PASSWORD,
-      auth: UPSTREAM_PASSWORD,
-      uuid: UPSTREAM_UUID
-    });
-  }
-
-  /*
-   * Request audio stream.
-   */
-
-  sendUpstreamJSON({
-    type: 'audio',
-    action: 'start',
-    protocol: 2,
-    codec: 'opus'
+  browserWss.handleUpgrade(req, socket, head, ws => {
+    browserWss.emit("connection", ws, req);
   });
+});
 
-  /*
-   * Send current receiver settings immediately.
-   */
+browserWss.on("connection", (client, req) => {
+  log("ACURA SDR visitor connected");
 
-  setTimeout(() => {
-    sendTune(currentFreq, currentMode);
-  }, 100);
-}
-
-
-/* ============================================================
- * TUNING
- * ============================================================
- */
-
-function sendTune(freq, mode) {
-  currentFreq = normalizeFrequency(freq);
-  currentMode = normalizeMode(mode);
-
-  log(
-    'UPSTREAM TUNE ->',
-    currentFreq,
-    'Hz',
-    currentMode
+  const requestUrl = new URL(
+    req.url,
+    `http://${req.headers.host || "localhost"}`
   );
 
-  if (
-    !upstream ||
-    upstream.readyState !== WebSocket.OPEN
-  ) {
-    log('Tune requested while upstream not ready');
-    return false;
-  }
-
-  /*
-   * VibeSDR/UberSDR control message.
-   *
-   * Include both "frequency" and "freq" for compatibility
-   * between VibeServer builds.
-   */
-
-  const command = {
-    type: 'tune',
-    frequency: currentFreq,
-    freq: currentFreq,
-    mode: currentMode
-  };
-
-  return sendUpstreamJSON(command);
-}
-
-
-/* ============================================================
- * UPSTREAM CONNECTION
- * ============================================================
- */
-
-function scheduleReconnect() {
-  if (reconnectTimer) {
-    return;
-  }
-
-  const delay = reconnectDelay;
-
-  reconnectDelay = Math.min(
-    reconnectDelay * 2,
-    15000
+  let frequency = normalizeFrequency(
+    requestUrl.searchParams.get("frequency") ||
+    requestUrl.searchParams.get("freq") ||
+    14250000
   );
 
-  log(`Upstream reconnect scheduled in ${delay} ms`);
+  let mode = normalizeMode(
+    requestUrl.searchParams.get("mode") || "usb"
+  );
 
-  reconnectTimer = setTimeout(() => {
-    reconnectTimer = null;
-    connectUpstream();
-  }, delay);
-}
+  const uuid =
+    requestUrl.searchParams.get("uuid") ||
+    requestUrl.searchParams.get("user_session_id") ||
+    makeUuid();
 
-
-function connectUpstream() {
-  if (upstreamConnecting) {
-    return;
-  }
-
-  if (
-    upstream &&
-    (
-      upstream.readyState === WebSocket.OPEN ||
-      upstream.readyState === WebSocket.CONNECTING
-    )
-  ) {
-    return;
-  }
-
-  const url = makeUpstreamUrl();
-
-  if (!url) {
-    log('ERROR: No UberSDR/VibeSDR upstream URL configured.');
-    log(
-      'Set UBERSDR_URL, VIBESDR_URL, or UPSTREAM_URL in Railway Variables.'
-    );
-
-    broadcastText({
-      type: 'status',
-      upstream: false,
-      error: 'UPSTREAM_NOT_CONFIGURED'
-    });
-
-    return;
-  }
-
-  upstreamConnecting = true;
-  upstreamReady = false;
-
-  log('Connecting to VibeSDR/UberSDR upstream...');
-  log('Upstream audio socket:', url);
-
-  const headers = {
-    'User-Agent': 'ACURA-DX1000/2.0'
+  let upstream = null;
+  let closed = false;
+  let reconnectTimer = null;
+  let lastTune = {
+    frequency,
+    mode
   };
 
-  if (UPSTREAM_PASSWORD) {
-    headers['Authorization'] =
-      `Bearer ${UPSTREAM_PASSWORD}`;
+  function sendClient(obj) {
+    if (client.readyState === WebSocket.OPEN) {
+      try {
+        client.send(JSON.stringify(obj));
+      } catch {}
+    }
   }
 
-  let ws;
+  function connectUpstream() {
+    if (closed) return;
 
-  try {
-    ws = new WebSocket(url, {
-      headers,
-      handshakeTimeout: 10000,
-      perMessageDeflate: false
-    });
-  } catch (err) {
-    upstreamConnecting = false;
+    if (upstream) {
+      try {
+        upstream.removeAllListeners();
+        upstream.terminate();
+      } catch {}
 
-    log(
-      'Unable to create upstream WebSocket:',
-      err.message
-    );
-
-    scheduleReconnect();
-    return;
-  }
-
-  upstream = ws;
-
-  ws.binaryType = 'nodebuffer';
-
-
-  ws.on('open', () => {
-    upstreamConnecting = false;
-    upstreamReady = true;
-    reconnectDelay = 1000;
-
-    log('================================');
-    log('VibeSDR / UberSDR UPSTREAM OPEN');
-    log('================================');
-
-    broadcastText({
-      type: 'status',
-      upstream: true
-    });
-
-    sendHandshake();
-  });
-
-
-  ws.on('message', (data, isBinary) => {
-    lastUpstreamMessageAt = Date.now();
-
-    /*
-     * ========================================================
-     * BINARY = AUDIO
-     * ========================================================
-     */
-
-    if (isBinary) {
-      const packet = Buffer.isBuffer(data)
-        ? data
-        : Buffer.from(data);
-
-      audioPackets++;
-      audioBytes += packet.length;
-      lastAudioAt = Date.now();
-
-      /*
-       * IMPORTANT:
-       *
-       * Do NOT alter the packet.
-       *
-       * VibeSDR/UberSDR V2 audio contains the V2 header
-       * followed by the Opus payload.
-       *
-       * The ACURA browser receives exactly the same packet.
-       */
-
-      broadcastBinary(packet);
-
-      if (
-        audioPackets === 1 ||
-        audioPackets % 250 === 0
-      ) {
-        log(
-          `AUDIO: ${audioPackets} packets / ${audioBytes} bytes`
-        );
-      }
-
-      return;
-    }
-
-
-    /*
-     * ========================================================
-     * TEXT / CONTROL
-     * ========================================================
-     */
-
-    const text = data.toString();
-
-    log(
-      'UPSTREAM TEXT:',
-      text.substring(0, 500)
-    );
-
-    let msg;
-
-    try {
-      msg = JSON.parse(text);
-    } catch (_) {
-      /*
-       * Pass non-JSON status messages to browser.
-       */
-      broadcastText({
-        type: 'upstream',
-        data: text
-      });
-
-      return;
-    }
-
-
-    /*
-     * If server explicitly reports ready/authenticated,
-     * resend tune to guarantee receiver synchronization.
-     */
-
-    const type = String(
-      msg.type ||
-      msg.event ||
-      msg.status ||
-      ''
-    ).toLowerCase();
-
-    if (
-      type.includes('ready') ||
-      type.includes('authenticated') ||
-      type.includes('connected') ||
-      type === 'hello'
-    ) {
-      upstreamReady = true;
-
-      sendTune(
-        currentFreq,
-        currentMode
-      );
-    }
-
-
-    /*
-     * Signal meter / RSSI forwarding.
-     */
-
-    const rssi =
-      msg.rssi ??
-      msg.signal ??
-      msg.dbm ??
-      msg.smeter ??
-      msg.sMeter;
-
-    if (
-      rssi !== undefined &&
-      rssi !== null &&
-      Number.isFinite(Number(rssi))
-    ) {
-      broadcastText({
-        type: 'meter',
-        rssi: Number(rssi),
-        dbm: Number(rssi)
-      });
-    }
-
-
-    /*
-     * Forward control message to browser.
-     */
-
-    broadcastText(msg);
-  });
-
-
-  ws.on('ping', data => {
-    try {
-      ws.pong(data);
-    } catch (_) {}
-  });
-
-
-  ws.on('close', (code, reason) => {
-    const reasonText = reason
-      ? reason.toString()
-      : '';
-
-    log(
-      'VibeSDR/UberSDR upstream closed:',
-      code,
-      reasonText
-    );
-
-    upstreamReady = false;
-    upstreamConnecting = false;
-
-    if (upstream === ws) {
       upstream = null;
     }
 
-    broadcastText({
-      type: 'status',
-      upstream: false
-    });
-
-    scheduleReconnect();
-  });
-
-
-  ws.on('error', err => {
-    log(
-      'VibeSDR/UberSDR upstream ERROR:',
-      err.message
-    );
-  });
-
-
-  ws.on('unexpected-response', (request, response) => {
-    log(
-      'UPSTREAM HTTP REJECTION:',
-      response.statusCode,
-      response.statusMessage || ''
+    const upstreamUrl = buildUpstreamUrl(
+      frequency,
+      mode,
+      uuid
     );
 
-    let body = '';
+    log("Connecting to VibeSDR/UberSDR upstream...");
+    log("Upstream:", upstreamUrl.replace(/password=[^&]+/g, "password=***"));
 
-    response.on('data', chunk => {
-      body += chunk.toString();
-    });
-
-    response.on('end', () => {
-      if (body) {
-        log(
-          'UPSTREAM RESPONSE:',
-          body.substring(0, 1000)
-        );
+    upstream = new WebSocket(upstreamUrl, {
+      perMessageDeflate: false,
+      handshakeTimeout: 15000,
+      headers: {
+        "User-Agent":
+          "ACURA-DX-1000/1 (+https://acurahamradio.org)"
       }
     });
-  });
-}
 
+    upstream.binaryType = "nodebuffer";
 
-/* ============================================================
- * BROWSER WEBSOCKET
- * ============================================================
- */
+    upstream.on("open", () => {
+      log("UPSTREAM AUDIO CONNECTED");
 
-const browserWSS = new WebSocket.Server({
-  noServer: true,
-  perMessageDeflate: false
-});
+      sendClient({
+        type: "status",
+        status: "connected",
+        frequency,
+        mode
+      });
 
+      /*
+       * VibePowerModule.swift reasserts the tune after
+       * the first received packet because commands sent
+       * during the handshake can be lost.
+       *
+       * We do the same below when the first binary
+       * packet arrives.
+       */
+    });
 
-browserWSS.on('connection', ws => {
-  browserClients.add(ws);
+    let firstPacket = true;
 
-  log('ACURA SDR visitor connected');
+    upstream.on("message", (data, isBinary) => {
+      if (closed) return;
 
-  safeSend(
-    ws,
-    JSON.stringify({
-      type: 'status',
-      connected: true,
-      upstream: upstreamReady,
-      frequency: currentFreq,
-      mode: currentMode,
-      protocol: 'VibeSDR / UberSDR V2',
-      audio: 'Opus + V2 header'
-    })
-  );
+      if (isBinary) {
+        const packet = Buffer.isBuffer(data)
+          ? data
+          : Buffer.from(data);
 
-  /*
-   * Make sure upstream exists whenever somebody opens radio.
-   */
+        if (packet.length < 21) {
+          return;
+        }
 
-  connectUpstream();
+        /*
+         * VibeSDR V2 header
+         */
 
+        const sampleRate = packet.readUInt32LE(8);
+        const channels = packet.readUInt8(12);
+        const basebandPower = packet.readFloatLE(13);
+        const noiseDensity = packet.readFloatLE(17);
 
-  ws.on('message', (data, isBinary) => {
-    if (isBinary) {
-      return;
-    }
+        if (firstPacket) {
+          firstPacket = false;
 
-    const text = data.toString().trim();
+          log(
+            "FIRST AUDIO PACKET",
+            "bytes=" + packet.length,
+            "rate=" + sampleRate,
+            "channels=" + channels
+          );
 
-    if (!text) {
-      return;
-    }
+          /*
+           * Exact tune command used by VibePowerModule.swift
+           */
+
+          if (upstream.readyState === WebSocket.OPEN) {
+            upstream.send(
+              JSON.stringify({
+                type: "tune",
+                frequency: lastTune.frequency,
+                mode: lastTune.mode
+              })
+            );
+
+            log(
+              "TUNE ASSERT ->",
+              lastTune.frequency,
+              "Hz",
+              lastTune.mode
+            );
+          }
+        }
+
+        /*
+         * Send the COMPLETE V2 packet unchanged.
+         *
+         * This preserves the 21-byte header + Opus payload
+         * expected by the ACURA browser decoder.
+         */
+
+        if (client.readyState === WebSocket.OPEN) {
+          client.send(packet, {
+            binary: true
+          });
+        }
+
+        /*
+         * Signal data for the S-meter.
+         *
+         * basebandPower and noiseDensity come directly
+         * from the VibeSDR V2 packet header.
+         */
+
+        sendClient({
+          type: "signal",
+          basebandPower,
+          noiseDensity,
+          sampleRate,
+          channels
+        });
+
+        return;
+      }
+
+      /*
+       * Preserve upstream JSON/text messages.
+       */
+
+      const text = data.toString();
+
+      if (client.readyState === WebSocket.OPEN) {
+        client.send(text);
+      }
+    });
+
+    upstream.on("unexpected-response", (request, response) => {
+      log(
+        "UPSTREAM HTTP REJECTION:",
+        response.statusCode,
+        response.statusMessage
+      );
+
+      let body = "";
+
+      response.on("data", chunk => {
+        body += chunk.toString();
+      });
+
+      response.on("end", () => {
+        if (body) {
+          log("UPSTREAM RESPONSE:", body.slice(0, 1000));
+        }
+
+        sendClient({
+          type: "status",
+          status: "upstream-http-error",
+          code: response.statusCode
+        });
+      });
+    });
+
+    upstream.on("error", err => {
+      log("UPSTREAM ERROR:", err.message);
+
+      sendClient({
+        type: "status",
+        status: "error",
+        message: err.message
+      });
+    });
+
+    upstream.on("close", (code, reason) => {
+      log(
+        "UPSTREAM CLOSED:",
+        code,
+        reason ? reason.toString() : ""
+      );
+
+      upstream = null;
+
+      if (!closed) {
+        clearTimeout(reconnectTimer);
+
+        reconnectTimer = setTimeout(() => {
+          log("Reconnecting upstream...");
+          connectUpstream();
+        }, 2000);
+      }
+    });
+  }
+
+  client.on("message", (data, isBinary) => {
+    if (isBinary) return;
 
     let msg;
 
     try {
-      msg = JSON.parse(text);
-    } catch (_) {
-
-      /*
-       * Allow simple:
-       *
-       * 7.255
-       * 7255000
-       */
-
-      const f = Number(text);
-
-      if (Number.isFinite(f)) {
-        const hz = normalizeFrequency(f);
-
-        log(
-          'ACURA TUNE REQUEST ->',
-          hz,
-          'Hz',
-          currentMode
-        );
-
-        sendTune(hz, currentMode);
-      }
-
+      msg = JSON.parse(data.toString());
+    } catch {
       return;
     }
 
-
-    const type = String(
-      msg.type ||
-      msg.action ||
-      msg.command ||
-      ''
-    ).toLowerCase();
-
-
     /*
-     * ========================================================
-     * TUNE
-     * ========================================================
+     * Accept the ACURA page's different tune command
+     * shapes without changing the webpage.
      */
 
     if (
-      type === 'tune' ||
-      type === 'frequency' ||
-      msg.frequency !== undefined ||
-      msg.freq !== undefined ||
-      msg.mhz !== undefined
+      msg.type === "tune" ||
+      msg.type === "frequency" ||
+      msg.type === "setFrequency" ||
+      msg.cmd === "tune"
     ) {
-      const rawFreq =
+      const requested =
         msg.frequency ??
         msg.freq ??
-        msg.mhz;
+        msg.hz ??
+        msg.value;
 
-      const mode =
-        msg.mode ??
-        currentMode;
+      if (requested !== undefined) {
+        frequency = normalizeFrequency(requested);
+      }
 
-      const hz =
-        normalizeFrequency(rawFreq);
+      if (msg.mode) {
+        mode = normalizeMode(msg.mode);
+      }
 
-      const normalizedMode =
-        normalizeMode(mode);
-
-      log(
-        'ACURA TUNE REQUEST ->',
-        hz,
-        'Hz',
-        normalizedMode
-      );
-
-      sendTune(
-        hz,
-        normalizedMode
-      );
-
-      return;
-    }
-
-
-    /*
-     * ========================================================
-     * MODE
-     * ========================================================
-     */
-
-    if (
-      type === 'mode' &&
-      msg.mode
-    ) {
-      currentMode =
-        normalizeMode(msg.mode);
+      lastTune = {
+        frequency,
+        mode
+      };
 
       log(
-        'ACURA MODE REQUEST ->',
-        currentMode
+        "ACURA TUNE REQUEST ->",
+        frequency,
+        "Hz",
+        mode
       );
-
-      sendTune(
-        currentFreq,
-        currentMode
-      );
-
-      return;
-    }
-
-
-    /*
-     * ========================================================
-     * START / POWER ON
-     * ========================================================
-     */
-
-    if (
-      type === 'start' ||
-      type === 'power' ||
-      type === 'on' ||
-      msg.power === true
-    ) {
-      log('ACURA RADIO POWER ON');
-
-      connectUpstream();
 
       if (
         upstream &&
         upstream.readyState === WebSocket.OPEN
       ) {
-        sendHandshake();
+        /*
+         * EXACT command used by VibePowerModule.swift.
+         */
+
+        upstream.send(
+          JSON.stringify({
+            type: "tune",
+            frequency,
+            mode
+          })
+        );
+
+        log(
+          "LIVE TUNE SENT ->",
+          frequency,
+          "Hz",
+          mode
+        );
+      } else {
+        log("Tune queued until upstream connects");
       }
 
       return;
     }
 
-
     /*
-     * ========================================================
-     * PING
-     * ========================================================
+     * Bandwidth command.
      */
 
-    if (type === 'ping') {
-      safeSend(
-        ws,
-        JSON.stringify({
-          type: 'pong',
-          time: Date.now()
-        })
-      );
+    if (
+      msg.type === "bandwidth" ||
+      msg.bandwidthLow !== undefined ||
+      msg.bandwidthHigh !== undefined
+    ) {
+      if (
+        upstream &&
+        upstream.readyState === WebSocket.OPEN
+      ) {
+        upstream.send(
+          JSON.stringify({
+            type: "tune",
+            bandwidthLow:
+              Number(msg.bandwidthLow ?? msg.low ?? -2700),
+            bandwidthHigh:
+              Number(msg.bandwidthHigh ?? msg.high ?? 2700)
+          })
+        );
+      }
 
       return;
     }
 
-
     /*
-     * Forward unknown JSON control message upstream.
+     * Other VibeSDR commands pass straight through.
      */
 
     if (
       upstream &&
       upstream.readyState === WebSocket.OPEN
     ) {
-      safeSend(
-        upstream,
-        JSON.stringify(msg)
-      );
+      upstream.send(data.toString());
     }
   });
 
+  client.on("close", () => {
+    closed = true;
 
-  ws.on('close', () => {
-    browserClients.delete(ws);
+    clearTimeout(reconnectTimer);
 
-    log('ACURA SDR visitor disconnected');
-  });
-
-
-  ws.on('error', err => {
-    browserClients.delete(ws);
-
-    log(
-      'ACURA browser socket error:',
-      err.message
-    );
-  });
-});
-
-
-/* ============================================================
- * HTTP -> WEBSOCKET UPGRADE
- * ============================================================
- */
-
-server.on('upgrade', (request, socket, head) => {
-  let pathname;
-
-  try {
-    const url = new URL(
-      request.url,
-      `http://${request.headers.host || 'localhost'}`
-    );
-
-    pathname = url.pathname;
-  } catch (_) {
-    socket.destroy();
-    return;
-  }
-
-  if (pathname !== '/sdr') {
-    socket.destroy();
-    return;
-  }
-
-  browserWSS.handleUpgrade(
-    request,
-    socket,
-    head,
-    ws => {
-      browserWSS.emit(
-        'connection',
-        ws,
-        request
-      );
-    }
-  );
-});
-
-
-/* ============================================================
- * HEALTH / DEBUG
- * ============================================================
- */
-
-app.get('/', (req, res) => {
-  res.json({
-    service: 'ACURA DX-1000 SDR BRIDGE',
-    status: 'online',
-
-    browserSocket: '/sdr',
-
-    protocol:
-      'VibeSDR / UberSDR V2',
-
-    audio:
-      'Opus + V2 header',
-
-    upstreamConfigured:
-      Boolean(UPSTREAM),
-
-    upstreamConnected:
-      Boolean(
-        upstream &&
-        upstream.readyState === WebSocket.OPEN
-      ),
-
-    upstreamReady,
-
-    browserClients:
-      browserClients.size,
-
-    frequencyHz:
-      currentFreq,
-
-    mode:
-      currentMode,
-
-    audioPackets,
-
-    audioBytes,
-
-    lastAudioMsAgo:
-      lastAudioAt
-        ? Date.now() - lastAudioAt
-        : null,
-
-    lastUpstreamMessageMsAgo:
-      lastUpstreamMessageAt
-        ? Date.now() - lastUpstreamMessageAt
-        : null
-  });
-});
-
-
-app.get('/health', (req, res) => {
-  res.json({
-    ok: true,
-    upstreamConfigured:
-      Boolean(UPSTREAM),
-    upstreamReady,
-    audioPackets,
-    browserClients:
-      browserClients.size
-  });
-});
-
-
-/* ============================================================
- * KEEPALIVE
- * ============================================================
- */
-
-setInterval(() => {
-
-  /*
-   * Browser keepalive
-   */
-
-  for (const ws of browserClients) {
-    if (ws.readyState === WebSocket.OPEN) {
+    if (upstream) {
       try {
-        ws.ping();
-      } catch (_) {}
+        upstream.close();
+      } catch {}
+
+      upstream = null;
     }
-  }
 
+    log("ACURA SDR visitor disconnected");
+  });
 
-  /*
-   * Upstream keepalive / reconnect
-   */
+  client.on("error", err => {
+    log("BROWSER SOCKET ERROR:", err.message);
+  });
 
-  if (
-    upstream &&
-    upstream.readyState === WebSocket.OPEN
-  ) {
-    try {
-      upstream.ping();
-    } catch (_) {}
-  } else if (
-    browserClients.size > 0
-  ) {
-    connectUpstream();
-  }
+  connectUpstream();
+});
 
-}, 15000);
-
-
-/* ============================================================
- * START
- * ============================================================
- */
-
-server.listen(PORT, '0.0.0.0', () => {
-  console.log('');
-  console.log('================================');
-  console.log('ACURA DX-1000 SDR BRIDGE');
-  console.log('================================');
-  console.log(`Port: ${PORT}`);
-  console.log('Browser socket: /sdr');
-  console.log('Protocol: VibeSDR / UberSDR V2');
-  console.log('Audio: Opus + V2 header');
-  console.log(
-    'ACURA MHz -> UberSDR Hz conversion: ENABLED'
-  );
-  console.log(
-    `Upstream: ${UPSTREAM ? 'CONFIGURED' : 'NOT CONFIGURED'}`
-  );
-  console.log('================================');
-  console.log('');
-
-  if (UPSTREAM) {
-    connectUpstream();
-  }
+server.listen(PORT, "0.0.0.0", () => {
+  console.log("");
+  console.log("==============================");
+  console.log("ACURA DX-1000 SDR BRIDGE");
+  console.log("==============================");
+  console.log("Port:", PORT);
+  console.log("Browser socket: /sdr");
+  console.log("Protocol: VibeSDR / UberSDR V2");
+  console.log("Upstream endpoint: /ws");
+  console.log("Audio: Opus + 21-byte V2 header");
+  console.log("Live tuning: ENABLED");
+  console.log("S-meter data: ENABLED");
+  console.log("Upstream:", UPSTREAM_BASE);
+  console.log("==============================");
+  console.log("");
 });
