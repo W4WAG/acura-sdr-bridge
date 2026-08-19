@@ -154,15 +154,14 @@ function estimateApproxDbm(int16Samples) {
   }
   const rms = Math.sqrt(sumSq / int16Samples.length) / 32768;
   const dbfs = rms > 0 ? 20 * Math.log10(rms) : -100;
-  // Calibrated so typical received speech moves through the middle
-  // and upper part of the scale instead of instantly slamming into
-  // the ceiling and sticking there no matter what (the old "+55"
-  // offset made almost any real speech clamp to the maximum on
-  // basically every packet, which is why the S-meter looked frozen
-  // whether or not anyone was talking). Still an approximation of
-  // real signal strength, not a decoded RF measurement -- see the
-  // note above this function.
-  const approx = dbfs * 1.8 - 8;
+  // Recalibrated from real on-air feedback: plain band static (no one
+  // transmitting) should sit near the bottom of the scale (~S1), a
+  // moderate/average received signal should land around the middle
+  // (~S5), and a solid, clearly-copyable signal should read around
+  // S9 -- with genuinely loud/strong audio climbing into S9+ above
+  // that. Still an approximation of real signal strength, not a
+  // decoded RF measurement -- see the note above this function.
+  const approx = dbfs * 2.4 - 37;
   return Math.max(-127, Math.min(0, approx));
 }
 
