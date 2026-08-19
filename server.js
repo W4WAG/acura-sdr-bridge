@@ -1,4 +1,4 @@
-Server · JS
+
 "use strict";
 const express = require("express");
 const http = require("http");
@@ -133,7 +133,7 @@ function resampleInt16(samples, srcRate, dstRate) {
 }
  
 /* ============================================================
-   RSSI APPROXIMATION — READ BEFORE TRUSTING THE S-METER
+   RSSI APPROXIMATION  -  READ BEFORE TRUSTING THE S-METER
    ---------------------------------------------------------
    UberSDR's V2 packet includes an 8-byte "signal metadata" field
    (offset 13-20) but its encoding isn't documented anywhere I have
@@ -144,7 +144,7 @@ function resampleInt16(samples, srcRate, dstRate) {
    RF measurement. Once this is live, compare the displayed reading
    against a known signal and we can tune the mapping below (or,
    better, figure out the real metadata layout and decode it
-   properly) — flagging this now so it isn't mistaken for accurate.
+   properly)  -  flagging this now so it isn't mistaken for accurate.
    ============================================================ */
 function estimateApproxDbm(int16Samples) {
   if (!int16Samples.length) return -127;
@@ -190,7 +190,7 @@ app.get("/test", (req, res) => {
   res.type("html").send(`<!doctype html>
 <html><head><meta charset="utf-8"><title>ACURA SDR Audio Test</title></head>
 <body style="background:#070b0e;color:#eee;font-family:Arial;text-align:center;padding:60px">
-<h1>ACURA SDR — AUDIO ONLY TEST</h1>
+<h1>ACURA SDR  -  AUDIO ONLY TEST</h1>
 <p>Use /sdr for the live tunable DX-1000 front-end.</p>
 </body></html>`);
 });
@@ -202,7 +202,7 @@ app.get("/test", (req, res) => {
    this was two separate server.on("upgrade") listeners; the first
    one destroyed the socket for any non-/sdr path, including
    /test-audio, and the second listener then tried to use that
-   already-destroyed socket — which throws and crashes the process.)
+   already-destroyed socket  -  which throws and crashes the process.)
    ============================================================ */
 const sdrWss = new WebSocket.Server({ noServer: true, perMessageDeflate: false });
 const testWss = new WebSocket.Server({ noServer: true, perMessageDeflate: false });
@@ -424,7 +424,7 @@ sdrWss.on("connection", browser => {
         // at exactly the requested frequency/mode.
         safeOpenUpstream(currentFrequency, currentMode);
       } else if (upstream.readyState === WebSocket.OPEN) {
-        // Already connected — retune the live session in place.
+        // Already connected  -  retune the live session in place.
         try {
           upstream.send(JSON.stringify({
             type: "tune",
@@ -440,7 +440,7 @@ sdrWss.on("connection", browser => {
     }
  
     if (msg.type === "rf_gain") {
-      // Forwarded best-effort — not confirmed the upstream honors this.
+      // Forwarded best-effort  -  not confirmed the upstream honors this.
       if (upstream && upstream.readyState === WebSocket.OPEN) {
         try {
           upstream.send(JSON.stringify({ type: "rf_gain", value: msg.value }));
@@ -473,7 +473,7 @@ sdrWss.on("connection", browser => {
  
 /* ============================================================
    LEGACY FIXED-FREQUENCY TEST ENDPOINT (unchanged behavior, kept
-   for /test — now correctly reachable via the single upgrade router)
+   for /test  -  now correctly reachable via the single upgrade router)
    ============================================================ */
 testWss.on("connection", async browser => {
   const sessionId = uuid();
@@ -567,7 +567,7 @@ testWss.on("connection", async browser => {
 server.listen(PORT, "0.0.0.0", () => {
   console.log("");
   console.log("==============================");
-  console.log("ACURA SDR BRIDGE — v2.2 (/sdr live tuning, crash-hardened)");
+  console.log("ACURA SDR BRIDGE  -  v2.2 (/sdr live tuning, crash-hardened)");
   console.log("==============================");
   console.log("Default:", (DEFAULT_FREQUENCY / 1e6).toFixed(3), "MHz", DEFAULT_MODE.toUpperCase());
   console.log("Live endpoint: /sdr");
