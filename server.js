@@ -6,6 +6,15 @@ const WebSocket = require("ws");
 const crypto = require("crypto");
 const OpusScript = require("opusscript");
  
+// Safety net: a single bad connection or unexpected error should never take
+// the whole service down. Log it and keep running instead of crashing.
+process.on("unhandledRejection", reason => {
+  console.error(new Date().toISOString(), "UNHANDLED REJECTION:", reason);
+});
+process.on("uncaughtException", err => {
+  console.error(new Date().toISOString(), "UNCAUGHT EXCEPTION:", err && err.stack ? err.stack : err);
+});
+ 
 const app = express();
 const server = http.createServer(app);
  
@@ -18,7 +27,7 @@ const PASSWORD =
   process.env.UPSTREAM_PASSWORD ||
   process.env.UBERSDR_PASSWORD ||
   "";
-const CLIENT = "ACURA-DX1000/2.1";
+const CLIENT = "ACURA-DX1000/2.2";
  
 // Defaults used only until the browser sends its first real "tune".
 const DEFAULT_FREQUENCY = 7255000; // Hz
@@ -188,8 +197,15 @@ app.get("/test", (req, res) => {
  
 /* ============================================================
    WEBSOCKET UPGRADE ROUTING
+   ---------------------------------------------------------
+   ONE handler for the whole server, routing by path. (Previously
+   this was two separate server.on("upgrade") listeners; the first
+   one destroyed the socket for any non-/sdr path, including
+   /test-audio, and the second listener then tried to use that
+   already-destroyed socket — which throws and crashes the process.)
    ============================================================ */
 const sdrWss = new WebSocket.Server({ noServer: true, perMessageDeflate: false });
+const testWss = new WebSocket.Server({ noServer: true, perMessageDeflate: false });
  
 server.on("upgrade", (req, socket, head) => {
   let path;
@@ -199,13 +215,22 @@ server.on("upgrade", (req, socket, head) => {
     socket.destroy();
     return;
   }
-  if (path !== "/sdr") {
-    socket.destroy();
+ 
+  if (path === "/sdr") {
+    sdrWss.handleUpgrade(req, socket, head, ws => {
+      sdrWss.emit("connection", ws);
+    });
     return;
   }
-  sdrWss.handleUpgrade(req, socket, head, ws => {
-    sdrWss.emit("connection", ws);
-  });
+ 
+  if (path === "/test-audio") {
+    testWss.handleUpgrade(req, socket, head, ws => {
+      testWss.emit("connection", ws);
+    });
+    return;
+  }
+ 
+  socket.destroy();
 });
  
 /* ============================================================
@@ -259,13 +284,23 @@ sdrWss.on("connection", browser => {
       return;
     }
  
-    const url = audioUrl(sessionId, frequency, mode);
-    log("OPENING UBERSDR AUDIO @", frequency, mode);
-    upstream = new WebSocket(url, {
-      handshakeTimeout: 15000,
-      perMessageDeflate: false,
-      headers: { "User-Agent": CLIENT }
-    });
+    let ws;
+    try {
+      const url = audioUrl(sessionId, frequency, mode);
+      log("OPENING UBERSDR AUDIO @", frequency, mode);
+      ws = new WebSocket(url, {
+        handshakeTimeout: 15000,
+        perMessageDeflate: false,
+        headers: { "User-Agent": CLIENT }
+      });
+    } catch (err) {
+      log("UPSTREAM WEBSOCKET CREATE FAILED:", err.message);
+      sendJSON({ type: "error", message: "Could not open receiver connection: " + err.message });
+      connecting = false;
+      return;
+    }
+ 
+    upstream = ws;
     upstream.binaryType = "nodebuffer";
     connecting = false;
  
@@ -289,7 +324,13 @@ sdrWss.on("connection", browser => {
  
       if (!decoder || decoderRate !== rate || decoderChannels !== channels) {
         if (decoder) { try { decoder.delete(); } catch {} }
-        decoder = new OpusScript(rate, channels, OpusScript.Application.AUDIO);
+        try {
+          decoder = new OpusScript(rate, channels, OpusScript.Application.AUDIO);
+        } catch (err) {
+          log("OPUS DECODER CREATE FAILED:", err.message);
+          decoder = null;
+          return;
+        }
         decoderRate = rate;
         decoderChannels = channels;
         log("OPUS DECODER:", rate, "Hz", channels, "ch");
@@ -355,6 +396,14 @@ sdrWss.on("connection", browser => {
     });
   }
  
+  function safeOpenUpstream(frequency, mode) {
+    openUpstream(frequency, mode).catch(err => {
+      log("openUpstream failed:", err && err.message ? err.message : err);
+      sendJSON({ type: "error", message: "Connection failed: " + (err && err.message ? err.message : String(err)) });
+      connecting = false;
+    });
+  }
+ 
   browser.on("message", data => {
     let msg;
     try {
@@ -373,14 +422,18 @@ sdrWss.on("connection", browser => {
       if (!upstream) {
         // First tune from the browser opens the upstream session
         // at exactly the requested frequency/mode.
-        openUpstream(currentFrequency, currentMode);
+        safeOpenUpstream(currentFrequency, currentMode);
       } else if (upstream.readyState === WebSocket.OPEN) {
         // Already connected — retune the live session in place.
-        upstream.send(JSON.stringify({
-          type: "tune",
-          frequency: currentFrequency,
-          mode: currentMode
-        }));
+        try {
+          upstream.send(JSON.stringify({
+            type: "tune",
+            frequency: currentFrequency,
+            mode: currentMode
+          }));
+        } catch (err) {
+          log("RETUNE SEND FAILED:", err.message);
+        }
         sendJSON({ type: "tuned", frequency: currentFrequency, mode: currentMode });
       }
       return;
@@ -391,7 +444,9 @@ sdrWss.on("connection", browser => {
       if (upstream && upstream.readyState === WebSocket.OPEN) {
         try {
           upstream.send(JSON.stringify({ type: "rf_gain", value: msg.value }));
-        } catch {}
+        } catch (err) {
+          log("RF_GAIN SEND FAILED:", err.message);
+        }
       }
       return;
     }
@@ -402,34 +457,24 @@ sdrWss.on("connection", browser => {
     destroy();
   });
  
+  browser.on("error", err => {
+    log("BROWSER SOCKET ERROR:", err.message);
+  });
+ 
   // If the browser never sends a tune (shouldn't happen with the
   // current front-end, which sends one immediately on open), fall
   // back to the default so audio still starts.
   setTimeout(() => {
     if (!closed && !upstream && !connecting) {
-      openUpstream(currentFrequency, currentMode);
+      safeOpenUpstream(currentFrequency, currentMode);
     }
   }, 1500);
 });
  
 /* ============================================================
-   LEGACY FIXED-FREQUENCY TEST ENDPOINT (unchanged, kept for /test)
+   LEGACY FIXED-FREQUENCY TEST ENDPOINT (unchanged behavior, kept
+   for /test — now correctly reachable via the single upgrade router)
    ============================================================ */
-const testWss = new WebSocket.Server({ noServer: true, perMessageDeflate: false });
- 
-server.on("upgrade", (req, socket, head) => {
-  let path;
-  try {
-    path = new URL(req.url, "http://localhost").pathname;
-  } catch {
-    return; // already handled/destroyed above for non-/sdr paths
-  }
-  if (path !== "/test-audio") return;
-  testWss.handleUpgrade(req, socket, head, ws => {
-    testWss.emit("connection", ws);
-  });
-});
- 
 testWss.on("connection", async browser => {
   const sessionId = uuid();
   let upstream = null;
@@ -452,11 +497,16 @@ testWss.on("connection", async browser => {
   }
   if (browser.readyState !== WebSocket.OPEN) return;
  
-  upstream = new WebSocket(audioUrl(sessionId, DEFAULT_FREQUENCY, DEFAULT_MODE), {
-    handshakeTimeout: 15000,
-    perMessageDeflate: false,
-    headers: { "User-Agent": CLIENT }
-  });
+  try {
+    upstream = new WebSocket(audioUrl(sessionId, DEFAULT_FREQUENCY, DEFAULT_MODE), {
+      handshakeTimeout: 15000,
+      perMessageDeflate: false,
+      headers: { "User-Agent": CLIENT }
+    });
+  } catch (err) {
+    log("TEST UPSTREAM CREATE FAILED:", err.message);
+    return;
+  }
   upstream.binaryType = "nodebuffer";
  
   upstream.on("message", (data, isBinary) => {
@@ -470,7 +520,12 @@ testWss.on("connection", async browser => {
  
     if (!decoder || decoderRate !== rate || decoderChannels !== channels) {
       if (decoder) { try { decoder.delete(); } catch {} }
-      decoder = new OpusScript(rate, channels, OpusScript.Application.AUDIO);
+      try {
+        decoder = new OpusScript(rate, channels, OpusScript.Application.AUDIO);
+      } catch {
+        decoder = null;
+        return;
+      }
       decoderRate = rate;
       decoderChannels = channels;
     }
@@ -502,7 +557,7 @@ testWss.on("connection", async browser => {
   });
  
   browser.on("close", destroy);
-  upstream.on("error", () => {});
+  upstream.on("error", err => log("TEST UPSTREAM ERROR:", err.message));
   upstream.on("close", () => { upstream = null; });
 });
  
@@ -512,7 +567,7 @@ testWss.on("connection", async browser => {
 server.listen(PORT, "0.0.0.0", () => {
   console.log("");
   console.log("==============================");
-  console.log("ACURA SDR BRIDGE — v2.1 (/sdr live tuning)");
+  console.log("ACURA SDR BRIDGE — v2.2 (/sdr live tuning, crash-hardened)");
   console.log("==============================");
   console.log("Default:", (DEFAULT_FREQUENCY / 1e6).toFixed(3), "MHz", DEFAULT_MODE.toUpperCase());
   console.log("Live endpoint: /sdr");
