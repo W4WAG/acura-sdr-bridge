@@ -26,7 +26,7 @@ const PASSWORD =
   process.env.UPSTREAM_PASSWORD ||
   process.env.UBERSDR_PASSWORD ||
   "";
-const CLIENT = "ACURA-DX1000/2.3";
+const CLIENT = "ACURA-DX1000/2.4";
 
 // Defaults used only until the browser sends its first real "tune".
 const DEFAULT_FREQUENCY = 7255000; // Hz
@@ -37,34 +37,42 @@ const DEFAULT_MODE = "lsb";
 // this rate or audio will play back at the wrong pitch/speed.
 const OUTPUT_RATE = 12000;
 
-/* ============================================================
-   THE v2.2 BUG, AND WHY THIS FILE EXISTS
-   ---------------------------------------------------------
-   v2.2 built its Opus decoder using the sample rate read out of
-   the UberSDR packet header (offset 8). That rate describes the
-   STREAM, not the rate of the Opus frames themselves - Opus is
-   natively 48 kHz. Constructing the decoder at, say, 12000 Hz
-   sizes libopus's output buffer for 12 kHz worth of samples, and
-   then a real 48 kHz frame decodes into four times that much
-   audio. libopus writes past the end of the buffer and the WASM
-   build aborts with:
-
-       OPUS DECODE ERROR: memory access out of bounds
-
-   ...on every single packet, forever, which is exactly what the
-   production logs showed. Audio was arriving fine; none of it
-   ever survived decoding.
-
-   The fix: always build the decoder at OPUS_NATIVE_RATE (48000),
-   which is both correct and the largest buffer Opus can need, so
-   no frame can overflow it. The existing resampler then converts
-   48000 -> OUTPUT_RATE for the front-end, which it was already
-   doing for every other rate anyway.
-   ============================================================ */
+// Opus is natively 48 kHz. Building the decoder at the rate in the packet
+// header (which describes the STREAM, not the frames) sizes libopus's
+// output buffer too small and every frame overflows it -- that was the
+// v2.2 bug, "memory access out of bounds" on every packet. Always 48 kHz.
 const OPUS_NATIVE_RATE = 48000;
 
 // Don't let a decode failure flood the logs the way v2.2 did.
 const DECODE_ERROR_LOG_LIMIT = 5;
+
+/* ============================================================
+   REAL SIGNAL METADATA  (new in v2.4)
+   ---------------------------------------------------------
+   v2.2/v2.3 estimated the S-meter from decoded audio loudness,
+   because the layout of UberSDR's 8-byte metadata field wasn't
+   known. It is now -- read straight out of UberSDR's own client:
+
+       s = view.getFloat32(13, true);   // signal power
+       l = view.getFloat32(17, true);   // noise density
+       window.currentBasebandPower = s;
+       window.currentNoiseDensity  = l;
+
+   Two little-endian Float32s. And their S-meter maps that value
+   on the standard HF scale:
+
+       t < -121        -> S0
+       t < -73         -> 1 + (t + 121) / 6      (6 dB per S-unit)
+       otherwise       -> 9 + (t + 73)  / 10     (dB over S9)
+
+   S9 = -73, which is the same scale the DX-1000 front-end uses,
+   so the value drops in directly as dBm with no fudge factor.
+
+   -999 is UberSDR's "not available" sentinel; if we ever see that
+   (or a malformed packet) we fall back to the old audio-loudness
+   estimate so the meter still does something sensible.
+   ============================================================ */
+const SIGNAL_UNAVAILABLE = -900; // anything below this is a sentinel
 
 function log(...args) {
   console.log(new Date().toISOString(), ...args);
@@ -138,9 +146,8 @@ function audioUrl(sessionId, frequency, mode) {
 
 /* ============================================================
    Simple linear-interpolation resampler.
-   The decoder now always runs at 48 kHz; the DX-1000 front-end
-   assumes every packet is 12 kHz, so everything is converted
-   before it goes out.
+   The decoder always runs at 48 kHz; the DX-1000 front-end
+   assumes every packet is 12 kHz.
    ============================================================ */
 function resampleInt16(samples, srcRate, dstRate) {
   if (srcRate === dstRate || samples.length === 0) return samples;
@@ -160,18 +167,8 @@ function resampleInt16(samples, srcRate, dstRate) {
 }
 
 /* ============================================================
-   RSSI APPROXIMATION  -  READ BEFORE TRUSTING THE S-METER
-   ---------------------------------------------------------
-   UberSDR's V2 packet includes an 8-byte "signal metadata" field
-   (offset 13-20) but its encoding isn't documented anywhere I have
-   access to, so decoding a real dBm value out of it would be a
-   guess dressed up as fact. Instead this estimates relative signal
-   presence from the decoded audio's RMS level, which will make the
-   S-meter move with real received audio but is NOT a calibrated
-   RF measurement. Once this is live, compare the displayed reading
-   against a known signal and we can tune the mapping below (or,
-   better, figure out the real metadata layout and decode it
-   properly)  -  flagging this now so it isn't mistaken for accurate.
+   FALLBACK ONLY -- used if the packet carries no real signal
+   metadata. This is the old v2.2/v2.3 approximation.
    ============================================================ */
 function estimateApproxDbm(int16Samples) {
   if (!int16Samples.length) return -127;
@@ -182,13 +179,6 @@ function estimateApproxDbm(int16Samples) {
   }
   const rms = Math.sqrt(sumSq / int16Samples.length) / 32768;
   const dbfs = rms > 0 ? 20 * Math.log10(rms) : -100;
-  // Recalibrated from real on-air feedback: plain band static (no one
-  // transmitting) should sit near the bottom of the scale (~S1), a
-  // moderate/average received signal should land around the middle
-  // (~S5), and a solid, clearly-copyable signal should read around
-  // S9 -- with genuinely loud/strong audio climbing into S9+ above
-  // that. Still an approximation of real signal strength, not a
-  // decoded RF measurement -- see the note above this function.
   const approx = dbfs * 2.4 - 37;
   return Math.max(-127, Math.min(0, approx));
 }
@@ -199,18 +189,27 @@ function encodeRssiRaw(dbm) {
   return Math.max(0, Math.min(65535, raw));
 }
 
+// Purely for the log line, so the value is readable at a glance.
+function formatSUnits(dbm) {
+  const s =
+    dbm < -121 ? 0 :
+    dbm < -73  ? 1 + (dbm + 121) / 6 :
+                 9 + (dbm + 73) / 10;
+  if (s < 1) return "S0";
+  if (s <= 9) return "S" + Math.round(s);
+  return "S9+" + Math.round(dbm + 73) + "dB";
+}
+
 /* ============================================================
    SHARED OPUS -> FRONT-END PACKET PIPELINE
-   ---------------------------------------------------------
-   Both /sdr and /test-audio used to carry their own copy of this
-   logic, which is how the same decoder bug ended up duplicated in
-   two places. There is now exactly one copy.
    ============================================================ */
 function makeAudioPipeline(label) {
   let decoder = null;
   let decoderChannels = 0;
   let decodeErrors = 0;
   let firstAudioLogged = false;
+  let firstSignalLogged = false;
+  let usingFallbackSignal = false;
 
   function destroy() {
     if (decoder) {
@@ -220,13 +219,9 @@ function makeAudioPipeline(label) {
     decoderChannels = 0;
   }
 
-  /**
-   * Takes one raw UberSDR V2 binary packet.
-   * Returns a Buffer ready to send to the front-end, or null.
-   */
   function handlePacket(packet) {
     // UberSDR V2: 0-7 timestamp, 8-11 rate, 12 channels,
-    // 13-20 signal metadata, 21+ Opus payload.
+    // 13-16 signal Float32 LE, 17-20 noise Float32 LE, 21+ Opus.
     if (packet.length <= 21) return null;
 
     const headerRate = packet.readUInt32LE(8);
@@ -234,8 +229,19 @@ function makeAudioPipeline(label) {
     if (![8000, 12000, 16000, 24000, 48000].includes(headerRate)) return null;
     if (channels !== 1 && channels !== 2) return null;
 
-    // NOTE: headerRate is deliberately NOT used to build the decoder.
-    // See the comment at the top of this file. Opus frames are 48 kHz.
+    // --- real signal metadata ---
+    let signalDbm = null;
+    let noiseDbm = null;
+    try {
+      const s = packet.readFloatLE(13);
+      const n = packet.readFloatLE(17);
+      if (Number.isFinite(s) && s > SIGNAL_UNAVAILABLE) signalDbm = s;
+      if (Number.isFinite(n) && n > SIGNAL_UNAVAILABLE) noiseDbm = n;
+    } catch {
+      signalDbm = null;
+      noiseDbm = null;
+    }
+
     if (!decoder || decoderChannels !== channels) {
       if (decoder) { try { decoder.delete(); } catch {} }
       try {
@@ -250,10 +256,8 @@ function makeAudioPipeline(label) {
         "(stream header said", headerRate, "Hz)");
     }
 
-    // Copy the payload out of the parent buffer. subarray() returns a
-    // view with a non-zero byteOffset, and handing that straight to a
-    // WASM-backed decoder is a known source of trouble; a standalone
-    // Buffer costs one memcpy and removes the whole class of problem.
+    // Copy the payload out of the parent buffer -- subarray() returns a
+    // view with a non-zero byteOffset, which WASM decoders dislike.
     const opus = Buffer.from(packet.subarray(21));
 
     let pcm;
@@ -284,11 +288,29 @@ function makeAudioPipeline(label) {
       }
     }
 
-    // Force everything to the fixed rate the front-end assumes.
     const resampled = resampleInt16(mono, OPUS_NATIVE_RATE, OUTPUT_RATE);
 
-    const approxDbm = estimateApproxDbm(resampled);
-    const rssiRaw = encodeRssiRaw(approxDbm);
+    // Real value if the receiver gave us one, estimate only if it didn't.
+    let dbm;
+    if (signalDbm !== null) {
+      dbm = Math.max(-127, Math.min(0, signalDbm));
+      if (!firstSignalLogged) {
+        firstSignalLogged = true;
+        log(label, "SIGNAL METADATA OK -", signalDbm.toFixed(1), "dBm",
+          "(" + formatSUnits(signalDbm) + ")",
+          noiseDbm !== null
+            ? "noise " + noiseDbm.toFixed(1) + " dBm, SNR " + Math.max(0, signalDbm - noiseDbm).toFixed(1) + " dB"
+            : "noise unavailable");
+      }
+    } else {
+      dbm = estimateApproxDbm(resampled);
+      if (!usingFallbackSignal) {
+        usingFallbackSignal = true;
+        log(label, "NO SIGNAL METADATA IN PACKET - falling back to audio-level estimate");
+      }
+    }
+
+    const rssiRaw = encodeRssiRaw(dbm);
 
     // Front-end packet: "SND" + 5 reserved + RSSI(u16 BE) + PCM16 BE mono
     const out = Buffer.allocUnsafe(10 + resampled.length * 2);
@@ -316,7 +338,7 @@ function makeAudioPipeline(label) {
 }
 
 /* ============================================================
-   STATIC PAGES (unchanged behavior)
+   STATIC PAGES
    ============================================================ */
 app.get("/", (req, res) => {
   res.type("text/plain").send(
@@ -345,12 +367,6 @@ app.get("/test", (req, res) => {
 
 /* ============================================================
    WEBSOCKET UPGRADE ROUTING
-   ---------------------------------------------------------
-   ONE handler for the whole server, routing by path. (Previously
-   this was two separate server.on("upgrade") listeners; the first
-   one destroyed the socket for any non-/sdr path, including
-   /test-audio, and the second listener then tried to use that
-   already-destroyed socket  -  which throws and crashes the process.)
    ============================================================ */
 const sdrWss = new WebSocket.Server({ noServer: true, perMessageDeflate: false });
 const testWss = new WebSocket.Server({ noServer: true, perMessageDeflate: false });
@@ -383,7 +399,6 @@ server.on("upgrade", (req, socket, head) => {
 
 /* ============================================================
    ONE BROWSER LISTENER = ONE UBERSDR SESSION
-   Frequency/mode now come from the browser, not a constant.
    ============================================================ */
 function attachBridge(browser, opts) {
   const label = opts.label;
@@ -504,11 +519,8 @@ function attachBridge(browser, opts) {
       currentMode = mode;
 
       if (!upstream) {
-        // First tune from the browser opens the upstream session
-        // at exactly the requested frequency/mode.
         safeOpenUpstream(currentFrequency, currentMode);
       } else if (upstream.readyState === WebSocket.OPEN) {
-        // Already connected  -  retune the live session in place.
         try {
           upstream.send(JSON.stringify({
             type: "tune",
@@ -524,7 +536,6 @@ function attachBridge(browser, opts) {
     }
 
     if (msg.type === "rf_gain") {
-      // Forwarded best-effort  -  not confirmed the upstream honors this.
       if (upstream && upstream.readyState === WebSocket.OPEN) {
         try {
           upstream.send(JSON.stringify({ type: "rf_gain", value: msg.value }));
@@ -546,12 +557,8 @@ function attachBridge(browser, opts) {
   });
 
   if (fixed) {
-    // /test-audio never tunes - open the default straight away.
     safeOpenUpstream(currentFrequency, currentMode);
   } else {
-    // If the browser never sends a tune (shouldn't happen with the
-    // current front-end, which sends one immediately on open), fall
-    // back to the default so audio still starts.
     setTimeout(() => {
       if (!closed && !upstream && !connecting) {
         safeOpenUpstream(currentFrequency, currentMode);
@@ -574,11 +581,12 @@ testWss.on("connection", browser => {
 server.listen(PORT, "0.0.0.0", () => {
   console.log("");
   console.log("==============================");
-  console.log("ACURA SDR BRIDGE  -  v2.3 (Opus decode fix)");
+  console.log("ACURA SDR BRIDGE  -  v2.4 (real S-meter metadata)");
   console.log("==============================");
   console.log("Default:", (DEFAULT_FREQUENCY / 1e6).toFixed(3), "MHz", DEFAULT_MODE.toUpperCase());
   console.log("Live endpoint: /sdr");
   console.log("Opus decoder rate:", OPUS_NATIVE_RATE, "Hz -> output", OUTPUT_RATE, "Hz");
+  console.log("S-meter: real signal metadata (Float32 LE @ offset 13)");
   console.log("==============================");
   console.log("");
 });
