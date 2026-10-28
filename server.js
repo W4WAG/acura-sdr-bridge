@@ -3,7 +3,9 @@ const express = require("express");
 const http = require("http");
 const WebSocket = require("ws");
 const crypto = require("crypto");
-const OpusScript = require("opusscript");
+// v2.5: we load opusscript's WASM libopus core directly instead of using
+// its OpusScript JS wrapper. See SafeOpusDecoder below for why.
+const createOpusNative = require("opusscript/build/opusscript_native_wasm.js");
 
 // Safety net: a single bad connection or unexpected error should never take
 // the whole service down. Log it and keep running instead of crashing.
@@ -201,6 +203,83 @@ function formatSUnits(dbm) {
 }
 
 /* ============================================================
+   SAFE OPUS DECODER  (new in v2.5)
+   ---------------------------------------------------------
+   The "memory access out of bounds" error on every packet was
+   NOT bad data from UberSDR -- the stream is valid Opus. It is a
+   bug in opusscript 0.1.1's JS wrapper: it builds its PCM output
+   view with HEAPU16.subarray(bytePointer, ...), treating a BYTE
+   address as a 16-bit INDEX, and then hands libopus that view's
+   byteOffset -- i.e. DOUBLE the address it actually allocated.
+   While the bridge is freshly started, that doubled address still
+   happens to land inside WASM memory, so audio works. Every
+   listener connection allocates more memory, so after the bridge
+   has run for a while the doubled address falls past the end of
+   WASM memory and EVERY decode traps. Restarting only hides it.
+
+   This class talks to the same compiled libopus directly with the
+   correct addresses, and re-reads the heap views on every call so
+   it also survives WASM memory growth.
+   ============================================================ */
+const OPUS_MAX_PACKET_BYTES = 1276 * 3; // same limits as libopus build
+const OPUS_MAX_FRAME_SAMPLES = 960 * 6; // 120 ms @ 48 kHz
+const OPUS_APPLICATION_AUDIO = 2049;
+
+let opusNative = null;
+function getOpusNative() {
+  if (!opusNative) opusNative = createOpusNative();
+  return opusNative;
+}
+
+class SafeOpusDecoder {
+  constructor(sampleRate, channels) {
+    const m = getOpusNative();
+    this.m = m;
+    this.channels = channels;
+    this.handler = new m.OpusScriptHandler(sampleRate, channels, OPUS_APPLICATION_AUDIO);
+    this.inPtr = m._malloc(OPUS_MAX_PACKET_BYTES);
+    // The native _decode writes every sample as TWO 16-bit slots
+    // (low byte, high byte), so reserve 2 x 16-bit per sample.
+    this.outPtr = m._malloc(OPUS_MAX_FRAME_SAMPLES * channels * 2 * 2);
+    if (!this.inPtr || !this.outPtr) {
+      this.delete();
+      throw new Error("Opus buffer allocation failed");
+    }
+  }
+
+  // Returns interleaved Int16Array PCM (length = frames * channels).
+  decode(opusBytes) {
+    if (!this.handler) throw new Error("decoder already deleted");
+    if (!opusBytes.length || opusBytes.length > OPUS_MAX_PACKET_BYTES) {
+      throw new Error("bad Opus packet size " + opusBytes.length);
+    }
+    const m = this.m;
+    m.HEAPU8.set(opusBytes, this.inPtr);
+    const frames = this.handler._decode(this.inPtr, opusBytes.length, this.outPtr);
+    if (frames < 0) throw new Error("Opus decode error " + frames);
+
+    const n = frames * this.channels;
+    const heap = m.HEAPU16;          // re-read: may change after memory growth
+    const base = this.outPtr >> 1;   // byte address -> 16-bit index
+    const out = new Int16Array(n);
+    for (let i = 0; i < n; i++) {
+      out[i] = (heap[base + 2 * i] & 0xff) | ((heap[base + 2 * i + 1] & 0xff) << 8);
+    }
+    return out;
+  }
+
+  delete() {
+    const m = this.m;
+    if (this.handler) {
+      try { m.OpusScriptHandler.destroy_handler(this.handler); } catch {}
+      this.handler = null;
+    }
+    if (this.inPtr) { try { m._free(this.inPtr); } catch {} this.inPtr = 0; }
+    if (this.outPtr) { try { m._free(this.outPtr); } catch {} this.outPtr = 0; }
+  }
+}
+
+/* ============================================================
    SHARED OPUS -> FRONT-END PACKET PIPELINE
    ============================================================ */
 function makeAudioPipeline(label) {
@@ -210,8 +289,10 @@ function makeAudioPipeline(label) {
   let firstAudioLogged = false;
   let firstSignalLogged = false;
   let usingFallbackSignal = false;
+  let destroyed = false;
 
   function destroy() {
+    destroyed = true;
     if (decoder) {
       try { decoder.delete(); } catch {}
       decoder = null;
@@ -220,6 +301,9 @@ function makeAudioPipeline(label) {
   }
 
   function handlePacket(packet) {
+    // Packets can still trickle in for a moment after the listener
+    // leaves; don't build a new decoder that would never be freed.
+    if (destroyed) return null;
     // UberSDR V2: 0-7 timestamp, 8-11 rate, 12 channels,
     // 13-16 signal Float32 LE, 17-20 noise Float32 LE, 21+ Opus.
     if (packet.length <= 21) return null;
@@ -245,7 +329,7 @@ function makeAudioPipeline(label) {
     if (!decoder || decoderChannels !== channels) {
       if (decoder) { try { decoder.delete(); } catch {} }
       try {
-        decoder = new OpusScript(OPUS_NATIVE_RATE, channels, OpusScript.Application.AUDIO);
+        decoder = new SafeOpusDecoder(OPUS_NATIVE_RATE, channels);
       } catch (err) {
         log(label, "OPUS DECODER CREATE FAILED:", err.message);
         decoder = null;
@@ -256,13 +340,11 @@ function makeAudioPipeline(label) {
         "(stream header said", headerRate, "Hz)");
     }
 
-    // Copy the payload out of the parent buffer -- subarray() returns a
-    // view with a non-zero byteOffset, which WASM decoders dislike.
-    const opus = Buffer.from(packet.subarray(21));
+    const opus = packet.subarray(21);
 
     let pcm;
     try {
-      pcm = Buffer.from(decoder.decode(opus));
+      pcm = decoder.decode(opus); // interleaved Int16Array
     } catch (err) {
       decodeErrors++;
       if (decodeErrors <= DECODE_ERROR_LOG_LIMIT) {
@@ -273,18 +355,15 @@ function makeAudioPipeline(label) {
     }
     if (!pcm.length) return null;
 
-    // Downmix to mono int16 LE -> Int16Array
-    const frameCount = channels === 1 ? pcm.length / 2 : pcm.length / 4;
-    const mono = new Int16Array(frameCount);
+    // Downmix to mono Int16Array
+    let mono;
     if (channels === 1) {
-      for (let i = 0; i < frameCount; i++) {
-        mono[i] = pcm.readInt16LE(i * 2);
-      }
+      mono = pcm;
     } else {
+      const frameCount = pcm.length / 2;
+      mono = new Int16Array(frameCount);
       for (let i = 0; i < frameCount; i++) {
-        const left = pcm.readInt16LE(i * 4);
-        const right = pcm.readInt16LE(i * 4 + 2);
-        mono[i] = Math.max(-32768, Math.min(32767, Math.round((left + right) / 2)));
+        mono[i] = Math.round((pcm[i * 2] + pcm[i * 2 + 1]) / 2);
       }
     }
 
@@ -471,7 +550,7 @@ function attachBridge(browser, opts) {
     });
 
     upstream.on("message", (data, isBinary) => {
-      if (!isBinary) return;
+      if (!isBinary || closed) return;
       const packet = Buffer.isBuffer(data) ? data : Buffer.from(data);
 
       const out = pipeline.handlePacket(packet);
@@ -581,7 +660,7 @@ testWss.on("connection", browser => {
 server.listen(PORT, "0.0.0.0", () => {
   console.log("");
   console.log("==============================");
-  console.log("ACURA SDR BRIDGE  -  v2.4 (real S-meter metadata)");
+  console.log("ACURA SDR BRIDGE  -  v2.5 (fixed Opus decoder + real S-meter metadata)");
   console.log("==============================");
   console.log("Default:", (DEFAULT_FREQUENCY / 1e6).toFixed(3), "MHz", DEFAULT_MODE.toUpperCase());
   console.log("Live endpoint: /sdr");
