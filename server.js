@@ -20,15 +20,46 @@ const app = express();
 const server = http.createServer(app);
 
 const PORT = Number(process.env.PORT || 8080);
-const UBERSDR_BASE =
-  process.env.UBERSDR_URL ||
-  process.env.UPSTREAM_URL ||
-  "https://ubersdr.k3fef.com";
 const PASSWORD =
   process.env.UPSTREAM_PASSWORD ||
   process.env.UBERSDR_PASSWORD ||
   "";
-const CLIENT = "ACURA-DX1000/2.4";
+const CLIENT = "ACURA-DX1000/3.0";
+
+/* ============================================================
+   RECEIVERS  (new in v3.0)
+   ---------------------------------------------------------
+   Tried in this order. The first one is the club's main
+   receiver; the rest are public UberSDR receivers used only
+   when the ones above them turn us away (for example K3FEF's
+   "2 users per IP" limit). All are listed in the public
+   UberSDR directory (instances.ubersdr.org).
+   The optional password only applies to the first receiver.
+   To change the list without editing code, set the RECEIVERS
+   variable in Railway to JSON like:
+   [{"callsign":"K3FEF","location":"Milford, PA","url":"https://ubersdr.k3fef.com"}]
+   ============================================================ */
+const DEFAULT_RECEIVERS = [
+  { callsign: "K3FEF", location: "Milford, PA", url: process.env.UBERSDR_URL || process.env.UPSTREAM_URL || "https://ubersdr.k3fef.com" },
+  { callsign: "K3GMQ", location: "Buckingham, PA", url: "https://ubersdr.k3gmq.com" },
+  { callsign: "N3NYN", location: "Clarksville, MD", url: "https://n3nyn.tunnel.ubersdr.org" },
+  { callsign: "KH2R", location: "Kerhonkson, NY", url: "https://kh2r.tunnel.ubersdr.org" },
+  { callsign: "K1RA", location: "Warrenton, VA", url: "https://ubersdr.k1ra.us:9443" }
+];
+
+function loadReceivers() {
+  if (process.env.RECEIVERS) {
+    try {
+      const list = JSON.parse(process.env.RECEIVERS);
+      if (Array.isArray(list) && list.length && list.every(r => r && r.url)) return list;
+      console.error("RECEIVERS variable ignored: must be a JSON list with a url on each item");
+    } catch (err) {
+      console.error("RECEIVERS variable ignored:", err.message);
+    }
+  }
+  return DEFAULT_RECEIVERS;
+}
+const RECEIVERS = loadReceivers();
 
 // Defaults used only until the browser sends its first real "tune".
 const DEFAULT_FREQUENCY = 7255000; // Hz
@@ -86,35 +117,49 @@ function uuid() {
     : crypto.randomBytes(16).toString("hex");
 }
 
-function httpBase() {
-  return UBERSDR_BASE.replace(/^wss:/i, "https:")
+function httpBase(receiver) {
+  return String(receiver.url).replace(/^wss:/i, "https:")
     .replace(/^ws:/i, "http:")
     .replace(/\/+$/, "");
 }
 
-function wsBase() {
-  return httpBase().replace(/^https:/i, "wss:").replace(/^http:/i, "ws:");
+function wsBase(receiver) {
+  return httpBase(receiver).replace(/^https:/i, "wss:").replace(/^http:/i, "ws:");
+}
+
+function receiverPassword(receiver) {
+  if (receiver.password) return receiver.password;
+  return receiver === RECEIVERS[0] ? PASSWORD : "";
 }
 
 /* ============================================================
    UBERSDR SESSION REGISTRATION
    ============================================================ */
-async function registerSession(sessionId) {
+async function registerSession(receiver, sessionId) {
   const url =
-    `${httpBase()}/connection?user_session_id=` + encodeURIComponent(sessionId);
+    `${httpBase(receiver)}/connection?user_session_id=` + encodeURIComponent(sessionId);
   const body = { user_session_id: sessionId };
-  if (PASSWORD) body.password = PASSWORD;
+  const password = receiverPassword(receiver);
+  if (password) body.password = password;
 
-  log("POST /connection");
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "User-Agent": CLIENT,
-      "X-Requested-With": "VibeSDR"
-    },
-    body: JSON.stringify(body)
-  });
+  log("POST /connection", receiver.callsign || receiver.url);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 10000);
+  let response;
+  try {
+    response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "User-Agent": CLIENT,
+        "X-Requested-With": "VibeSDR"
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal
+    });
+  } finally {
+    clearTimeout(timer);
+  }
   const text = await response.text();
   if (!response.ok) {
     throw new Error(`Registration HTTP ${response.status}: ${text}`);
@@ -134,7 +179,7 @@ async function registerSession(sessionId) {
 /* ============================================================
    UBERSDR AUDIO URL
    ============================================================ */
-function audioUrl(sessionId, frequency, mode) {
+function audioUrl(receiver, sessionId, frequency, mode) {
   const params = new URLSearchParams();
   params.set("user_session_id", sessionId);
   params.set("frequency", String(frequency));
@@ -142,8 +187,9 @@ function audioUrl(sessionId, frequency, mode) {
   params.set("format", "opus");
   params.set("version", "2");
   params.set("client", CLIENT);
-  if (PASSWORD) params.set("password", PASSWORD);
-  return `${wsBase()}/ws?${params.toString()}`;
+  const password = receiverPassword(receiver);
+  if (password) params.set("password", password);
+  return `${wsBase(receiver)}/ws?${params.toString()}`;
 }
 
 /* ============================================================
@@ -417,22 +463,305 @@ function makeAudioPipeline(label) {
 }
 
 /* ============================================================
+   SHARED CHANNELS  (new in v3.0)
+   ---------------------------------------------------------
+   v2.x opened one receiver session per browser listener, so
+   K3FEF's "2 users per IP" limit meant only 2 listeners for
+   the whole website. Now everyone tuned to the same frequency
+   and mode shares ONE receiver session (a "channel"): the
+   audio is decoded once and copied to every listener on it.
+
+   - A listener who is alone on a channel and retunes just
+     retunes that session (the DX-1000 dial sends many tunes).
+   - A listener who retunes away from a shared channel joins
+     an existing channel on the new frequency if there is one,
+     otherwise gets a new channel of their own.
+   - A new channel tries each receiver in RECEIVERS order and
+     uses the first one that accepts it.
+   - If a receiver drops a channel that still has listeners,
+     it reconnects automatically (up to MAX_RECONNECTS times).
+   ============================================================ */
+const MAX_RECONNECTS = 3;
+const SLOW_CLIENT_BYTES = 1024 * 1024; // skip audio for a listener this far behind
+
+const channels = new Set();
+let channelCounter = 0;
+
+function receiverInfo(receiver) {
+  return receiver
+    ? { callsign: receiver.callsign || "", location: receiver.location || "" }
+    : null;
+}
+
+class Channel {
+  constructor(frequency, mode) {
+    this.id = "CH" + (++channelCounter);
+    this.frequency = frequency;
+    this.mode = mode;
+    this.listeners = new Set();
+    this.receiver = null;
+    this.sessionId = null;
+    this.upstream = null;
+    this.upstreamOpen = false;
+    this.openedFrequency = null;
+    this.openedMode = null;
+    this.pipeline = null;
+    this.closed = false;
+    this.starting = false;
+    this.reconnects = 0;
+    this.gotAudio = false;
+    channels.add(this);
+    log(this.id, "CREATED @", frequency, mode);
+  }
+
+  tunedMessage() {
+    return {
+      type: "tuned",
+      frequency: this.frequency,
+      mode: this.mode,
+      receiver: receiverInfo(this.receiver),
+      listeners: this.listeners.size
+    };
+  }
+
+  broadcastJSON(obj) {
+    for (const l of this.listeners) l.sendJSON(obj);
+  }
+
+  add(listener) {
+    this.listeners.add(listener);
+    listener.channel = this;
+    if (this.upstreamOpen) listener.sendJSON(this.tunedMessage());
+    log(this.id, "LISTENER JOINED -", this.listeners.size, "on this channel");
+  }
+
+  remove(listener) {
+    this.listeners.delete(listener);
+    if (listener.channel === this) listener.channel = null;
+    log(this.id, "LISTENER LEFT -", this.listeners.size, "on this channel");
+    if (this.listeners.size === 0) this.close("no listeners");
+  }
+
+  // Only used when this channel has exactly one listener.
+  retune(frequency, mode) {
+    this.frequency = frequency;
+    this.mode = mode;
+    if (this.upstreamOpen && this.upstream && this.upstream.readyState === WebSocket.OPEN) {
+      try {
+        this.upstream.send(JSON.stringify({ type: "tune", frequency, mode }));
+        this.openedFrequency = frequency;
+        this.openedMode = mode;
+      } catch (err) {
+        log(this.id, "RETUNE SEND FAILED:", err.message);
+      }
+      this.broadcastJSON(this.tunedMessage());
+    }
+    // If still connecting, the open handler sends the latest tune.
+  }
+
+  setGain(value) {
+    if (this.listeners.size !== 1) return; // never let one listener change a shared channel
+    if (this.upstream && this.upstream.readyState === WebSocket.OPEN) {
+      try {
+        this.upstream.send(JSON.stringify({ type: "rf_gain", value }));
+      } catch (err) {
+        log(this.id, "RF_GAIN SEND FAILED:", err.message);
+      }
+    }
+  }
+
+  close(why) {
+    if (this.closed) return;
+    this.closed = true;
+    channels.delete(this);
+    log(this.id, "CLOSED -", why);
+    if (this.upstream) {
+      try { this.upstream.close(); } catch {}
+      this.upstream = null;
+    }
+    this.upstreamOpen = false;
+    if (this.pipeline) {
+      this.pipeline.destroy();
+      this.pipeline = null;
+    }
+    for (const l of this.listeners) {
+      if (l.channel === this) l.channel = null;
+    }
+    this.listeners.clear();
+  }
+
+  start() {
+    if (this.starting || this.closed) return;
+    this.starting = true;
+    this.tryReceivers(0, []).catch(err => {
+      log(this.id, "START FAILED:", err && err.message ? err.message : err);
+      this.failAll("Connection failed: " + (err && err.message ? err.message : String(err)));
+    });
+  }
+
+  failAll(message) {
+    this.broadcastJSON({ type: "error", message });
+    this.close("failed");
+  }
+
+  async tryReceivers(index, reasons) {
+    if (this.closed) return;
+    if (index >= RECEIVERS.length) {
+      this.starting = false;
+      this.failAll(
+        "Registration failed: all receivers are busy right now (" +
+        reasons.join("; ") + ")"
+      );
+      return;
+    }
+    const receiver = RECEIVERS[index];
+    const sessionId = uuid();
+    try {
+      await registerSession(receiver, sessionId);
+    } catch (err) {
+      const why = (receiver.callsign || receiver.url) + ": " + err.message;
+      log(this.id, "RECEIVER REFUSED -", why);
+      reasons.push(why);
+      return this.tryReceivers(index + 1, reasons);
+    }
+    if (this.closed) return;
+    this.openUpstream(receiver, sessionId, index, reasons);
+  }
+
+  openUpstream(receiver, sessionId, index, reasons) {
+    let ws;
+    try {
+      log(this.id, "OPENING", receiver.callsign || receiver.url, "AUDIO @", this.frequency, this.mode);
+      ws = new WebSocket(audioUrl(receiver, sessionId, this.frequency, this.mode), {
+        handshakeTimeout: 15000,
+        perMessageDeflate: false,
+        headers: { "User-Agent": CLIENT }
+      });
+    } catch (err) {
+      reasons.push((receiver.callsign || receiver.url) + ": " + err.message);
+      this.tryReceivers(index + 1, reasons).catch(() => {});
+      return;
+    }
+
+    this.receiver = receiver;
+    this.sessionId = sessionId;
+    this.upstream = ws;
+    this.openedFrequency = this.frequency;
+    this.openedMode = this.mode;
+    if (this.pipeline) this.pipeline.destroy();
+    this.pipeline = makeAudioPipeline(this.id);
+    ws.binaryType = "nodebuffer";
+
+    ws.on("open", () => {
+      if (this.closed || this.upstream !== ws) return;
+      this.upstreamOpen = true;
+      this.starting = false;
+      log(this.id, "AUDIO OPEN via", receiver.callsign || receiver.url);
+      // The listener may have retuned while we were connecting.
+      if (this.openedFrequency !== this.frequency || this.openedMode !== this.mode) {
+        try {
+          ws.send(JSON.stringify({ type: "tune", frequency: this.frequency, mode: this.mode }));
+          this.openedFrequency = this.frequency;
+          this.openedMode = this.mode;
+        } catch {}
+      }
+      this.broadcastJSON(this.tunedMessage());
+    });
+
+    ws.on("message", (data, isBinary) => {
+      if (!isBinary || this.closed || this.upstream !== ws || !this.pipeline) return;
+      const packet = Buffer.isBuffer(data) ? data : Buffer.from(data);
+      const out = this.pipeline.handlePacket(packet);
+      if (!out) return;
+      if (!this.gotAudio) {
+        this.gotAudio = true;
+        this.reconnects = 0;
+      }
+      for (const l of this.listeners) l.sendAudio(out);
+    });
+
+    ws.on("error", err => {
+      log(this.id, "UBERSDR ERROR (" + (receiver.callsign || receiver.url) + "):", err.message);
+    });
+
+    ws.on("close", (code, reason) => {
+      if (this.upstream !== ws) return;
+      const wasOpen = this.upstreamOpen;
+      log(this.id, "UBERSDR CLOSED (" + (receiver.callsign || receiver.url) + "):", code, reason ? reason.toString() : "");
+      this.upstream = null;
+      this.upstreamOpen = false;
+      if (this.closed) return;
+
+      if (!wasOpen) {
+        // Never got going on this receiver: try the next one.
+        reasons.push((receiver.callsign || receiver.url) + ": audio connection closed (" + code + ")");
+        this.tryReceivers(index + 1, reasons).catch(() => {});
+        return;
+      }
+      // It was working and dropped (session time limit, network blip...).
+      if (this.listeners.size === 0) { this.close("dropped, no listeners"); return; }
+      if (this.reconnects >= MAX_RECONNECTS) {
+        this.failAll("The receiver connection dropped. Please press play again.");
+        return;
+      }
+      this.reconnects++;
+      this.gotAudio = false;
+      this.starting = true;
+      log(this.id, "RECONNECTING, attempt", this.reconnects);
+      setTimeout(() => {
+        if (this.closed) return;
+        this.tryReceivers(0, []).catch(err => this.failAll("Connection failed: " + err.message));
+      }, 2000);
+    });
+  }
+}
+
+function findChannel(frequency, mode, except) {
+  for (const ch of channels) {
+    if (ch !== except && !ch.closed && ch.frequency === frequency && ch.mode === mode) return ch;
+  }
+  return null;
+}
+
+/* ============================================================
    STATIC PAGES
    ============================================================ */
 app.get("/", (req, res) => {
+  let listeners = 0;
+  for (const ch of channels) listeners += ch.listeners.size;
   res.type("text/plain").send(
-`ACURA SDR BRIDGE
+`ACURA SDR BRIDGE v3.0
 STATUS: ONLINE
 
 ENDPOINTS:
 /sdr         - live tunable WebSocket (DX-1000 front-end)
 /test-audio  - fixed-frequency test WebSocket
 /test        - simple browser test page
+/status      - what is playing right now (JSON)
+
+NOW: ${listeners} listener(s) on ${channels.size} receiver session(s)
+
+RECEIVERS (tried in this order):
+${RECEIVERS.map((r, i) => `${i + 1}. ${r.callsign || ""} ${r.location || ""}`.trim()).join("\n")}
 
 DEFAULT FREQUENCY:
 ${(DEFAULT_FREQUENCY / 1e6).toFixed(3)} MHz ${DEFAULT_MODE.toUpperCase()}
 `
   );
+});
+
+app.get("/status", (req, res) => {
+  res.json({
+    version: "3.0",
+    channels: [...channels].map(ch => ({
+      id: ch.id,
+      frequency: ch.frequency,
+      mode: ch.mode,
+      listeners: ch.listeners.size,
+      receiver: receiverInfo(ch.receiver),
+      open: ch.upstreamOpen
+    }))
+  });
 });
 
 app.get("/test", (req, res) => {
@@ -477,107 +806,58 @@ server.on("upgrade", (req, socket, head) => {
 });
 
 /* ============================================================
-   ONE BROWSER LISTENER = ONE UBERSDR SESSION
+   ONE BROWSER LISTENER  ->  JOINS A SHARED CHANNEL
    ============================================================ */
 function attachBridge(browser, opts) {
   const label = opts.label;
   const fixed = opts.fixed === true;
+  let closed = false;
 
   log(label, "BROWSER CONNECTED");
 
-  const sessionId = uuid();
-  const pipeline = makeAudioPipeline(label);
-  let upstream = null;
-  let connecting = false;
-  let currentFrequency = DEFAULT_FREQUENCY;
-  let currentMode = DEFAULT_MODE;
-  let closed = false;
-
-  function sendJSON(obj) {
-    if (browser.readyState === WebSocket.OPEN) {
-      browser.send(JSON.stringify(obj));
-    }
-  }
-
-  function destroy() {
-    closed = true;
-    if (upstream) {
-      try { upstream.close(); } catch {}
-      upstream = null;
-    }
-    pipeline.destroy();
-  }
-
-  async function openUpstream(frequency, mode) {
-    if (connecting || upstream) return;
-    connecting = true;
-    try {
-      await registerSession(sessionId);
-    } catch (err) {
-      log(label, "REGISTRATION FAILED:", err.message);
-      sendJSON({ type: "error", message: "Registration failed: " + err.message });
-      connecting = false;
-      return;
-    }
-    if (closed || browser.readyState !== WebSocket.OPEN) {
-      connecting = false;
-      return;
-    }
-
-    let ws;
-    try {
-      const url = audioUrl(sessionId, frequency, mode);
-      log(label, "OPENING UBERSDR AUDIO @", frequency, mode);
-      ws = new WebSocket(url, {
-        handshakeTimeout: 15000,
-        perMessageDeflate: false,
-        headers: { "User-Agent": CLIENT }
-      });
-    } catch (err) {
-      log(label, "UPSTREAM WEBSOCKET CREATE FAILED:", err.message);
-      sendJSON({ type: "error", message: "Could not open receiver connection: " + err.message });
-      connecting = false;
-      return;
-    }
-
-    upstream = ws;
-    upstream.binaryType = "nodebuffer";
-    connecting = false;
-
-    upstream.on("open", () => {
-      log(label, "UBERSDR AUDIO OPEN");
-      sendJSON({ type: "tuned", frequency: currentFrequency, mode: currentMode });
-    });
-
-    upstream.on("message", (data, isBinary) => {
-      if (!isBinary || closed) return;
-      const packet = Buffer.isBuffer(data) ? data : Buffer.from(data);
-
-      const out = pipeline.handlePacket(packet);
-      if (!out) return;
-
+  const listener = {
+    channel: null,
+    sendJSON(obj) {
       if (browser.readyState === WebSocket.OPEN) {
-        browser.send(out, { binary: true });
+        try { browser.send(JSON.stringify(obj)); } catch {}
       }
-    });
+    },
+    sendAudio(buf) {
+      if (browser.readyState !== WebSocket.OPEN) return;
+      if (browser.bufferedAmount > SLOW_CLIENT_BYTES) return; // slow connection: drop, don't pile up
+      try { browser.send(buf, { binary: true }); } catch {}
+    }
+  };
 
-    upstream.on("error", err => {
-      log(label, "UBERSDR ERROR:", err.message);
-      sendJSON({ type: "error", message: err.message });
-    });
+  function tuneTo(frequency, mode) {
+    if (closed) return;
+    const current = listener.channel;
 
-    upstream.on("close", (code, reason) => {
-      log(label, "UBERSDR CLOSED:", code, reason ? reason.toString() : "");
-      upstream = null;
-    });
-  }
+    // Already there.
+    if (current && !current.closed && current.frequency === frequency && current.mode === mode) {
+      if (current.upstreamOpen) listener.sendJSON(current.tunedMessage());
+      return;
+    }
 
-  function safeOpenUpstream(frequency, mode) {
-    openUpstream(frequency, mode).catch(err => {
-      log(label, "openUpstream failed:", err && err.message ? err.message : err);
-      sendJSON({ type: "error", message: "Connection failed: " + (err && err.message ? err.message : String(err)) });
-      connecting = false;
-    });
+    // Someone is already listening there: share it.
+    const existing = findChannel(frequency, mode, current);
+    if (existing) {
+      if (current) current.remove(listener);
+      existing.add(listener);
+      return;
+    }
+
+    // Alone on our channel: just retune it (no new receiver session).
+    if (current && !current.closed && current.listeners.size === 1) {
+      current.retune(frequency, mode);
+      return;
+    }
+
+    // Leave the shared channel and start our own.
+    if (current) current.remove(listener);
+    const ch = new Channel(frequency, mode);
+    ch.add(listener);
+    ch.start();
   }
 
   browser.on("message", data => {
@@ -592,43 +872,22 @@ function attachBridge(browser, opts) {
 
     if (msg.type === "tune") {
       const frequency = Number(msg.frequency);
-      const mode = String(msg.mode || currentMode);
       if (!Number.isFinite(frequency) || frequency <= 0) return;
-      currentFrequency = Math.round(frequency);
-      currentMode = mode;
-
-      if (!upstream) {
-        safeOpenUpstream(currentFrequency, currentMode);
-      } else if (upstream.readyState === WebSocket.OPEN) {
-        try {
-          upstream.send(JSON.stringify({
-            type: "tune",
-            frequency: currentFrequency,
-            mode: currentMode
-          }));
-        } catch (err) {
-          log(label, "RETUNE SEND FAILED:", err.message);
-        }
-        sendJSON({ type: "tuned", frequency: currentFrequency, mode: currentMode });
-      }
+      const mode = String(msg.mode || (listener.channel ? listener.channel.mode : DEFAULT_MODE)).toLowerCase();
+      tuneTo(Math.round(frequency), mode);
       return;
     }
 
     if (msg.type === "rf_gain") {
-      if (upstream && upstream.readyState === WebSocket.OPEN) {
-        try {
-          upstream.send(JSON.stringify({ type: "rf_gain", value: msg.value }));
-        } catch (err) {
-          log(label, "RF_GAIN SEND FAILED:", err.message);
-        }
-      }
+      if (listener.channel) listener.channel.setGain(msg.value);
       return;
     }
   });
 
   browser.on("close", () => {
+    closed = true;
     log(label, "BROWSER DISCONNECTED");
-    destroy();
+    if (listener.channel) listener.channel.remove(listener);
   });
 
   browser.on("error", err => {
@@ -636,12 +895,10 @@ function attachBridge(browser, opts) {
   });
 
   if (fixed) {
-    safeOpenUpstream(currentFrequency, currentMode);
+    tuneTo(DEFAULT_FREQUENCY, DEFAULT_MODE);
   } else {
     setTimeout(() => {
-      if (!closed && !upstream && !connecting) {
-        safeOpenUpstream(currentFrequency, currentMode);
-      }
+      if (!closed && !listener.channel) tuneTo(DEFAULT_FREQUENCY, DEFAULT_MODE);
     }, 1500);
   }
 }
@@ -660,12 +917,12 @@ testWss.on("connection", browser => {
 server.listen(PORT, "0.0.0.0", () => {
   console.log("");
   console.log("==============================");
-  console.log("ACURA SDR BRIDGE  -  v2.5 (fixed Opus decoder + real S-meter metadata)");
+  console.log("ACURA SDR BRIDGE  -  v3.0 (shared channels + backup receivers)");
   console.log("==============================");
   console.log("Default:", (DEFAULT_FREQUENCY / 1e6).toFixed(3), "MHz", DEFAULT_MODE.toUpperCase());
-  console.log("Live endpoint: /sdr");
+  console.log("Live endpoint: /sdr   Status: /status");
+  console.log("Receivers:", RECEIVERS.map(r => r.callsign || r.url).join(" -> "));
   console.log("Opus decoder rate:", OPUS_NATIVE_RATE, "Hz -> output", OUTPUT_RATE, "Hz");
-  console.log("S-meter: real signal metadata (Float32 LE @ offset 13)");
   console.log("==============================");
   console.log("");
 });
