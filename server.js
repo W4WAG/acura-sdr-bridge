@@ -24,7 +24,7 @@ const PASSWORD =
   process.env.UPSTREAM_PASSWORD ||
   process.env.UBERSDR_PASSWORD ||
   "";
-const CLIENT = "ACURA-DX1000/3.0";
+const CLIENT = "ACURA-DX1000/3.1";
 
 /* ============================================================
    RECEIVERS  (new in v3.0)
@@ -716,6 +716,237 @@ class Channel {
   }
 }
 
+/* ============================================================
+   VOICE WATCH  (new in v3.1)
+   ---------------------------------------------------------
+   Lights up "Talking now" on the Ocean Flight Tracker's VOICE
+   boxes. While at least one web page is watching (/voice-watch),
+   the relay keeps a quiet receiver session on each oceanic
+   pilot-voice frequency the page asks about and watches the
+   receiver's own signal-strength reading. No audio is decoded
+   or sent anywhere; it only reports "someone is talking" when
+   the signal rises clearly above that frequency's background.
+
+   - Uses the BACKUP receivers only (never K3FEF), so the
+     club's main receiver keeps its slots for real listeners.
+   - Only frequencies on the VOICE_WATCH_ALLOWED list are
+     accepted, and at most VOICE_WATCH_MAX at a time.
+   - Sessions stop VOICE_WATCH_LINGER_MS after the last page
+     stops watching, so nobody's receiver is tied up 24/7.
+   ============================================================ */
+const VOICE_WATCH_ALLOWED_KHZ = [2872, 2899, 2962, 2971, 3016, 3476, 4675, 5598, 5616, 5649, 6622,
+  8825, 8831, 8864, 8879, 8891, 8906, 11279, 11309, 11336, 13291, 13306, 17946];
+const VOICE_WATCH_MAX = 6;
+const VOICE_WATCH_LINGER_MS = 60000;
+const VOICE_ON_DB = 8;        // this far above background = talking
+const VOICE_OFF_DB = 5;       // drop below this to start the "stopped" timer
+const VOICE_ON_MS = 700;      // must stay up this long to count
+const VOICE_OFF_MS = 3000;    // keep "talking" lit this long after it fades
+
+const voiceWatchers = new Set();
+const voiceMonitors = new Map(); // frequency -> monitor
+let voiceStopTimer = null;
+
+function voiceAllowed(frequency) {
+  const khz = frequency / 1000;
+  return VOICE_WATCH_ALLOWED_KHZ.some(k => Math.abs(k - khz) <= 1);
+}
+
+function voiceReceivers() {
+  const backups = RECEIVERS.slice(1);
+  return backups.length ? backups : RECEIVERS;
+}
+
+function voiceBroadcast(obj) {
+  const text = JSON.stringify(obj);
+  for (const w of voiceWatchers) {
+    if (w.readyState === WebSocket.OPEN) {
+      try { w.send(text); } catch {}
+    }
+  }
+}
+
+function voiceSnapshot() {
+  return {
+    type: "voice_status",
+    frequencies: [...voiceMonitors.values()].map(m => ({
+      frequency: m.frequency,
+      active: m.active,
+      receiver: receiverInfo(m.receiver),
+      online: m.online
+    }))
+  };
+}
+
+class VoiceMonitor {
+  constructor(frequency) {
+    this.frequency = frequency;
+    this.mode = "usb";
+    this.ws = null;
+    this.receiver = null;
+    this.online = false;
+    this.stopped = false;
+    this.active = false;
+    this.baseline = null;
+    this.warm = [];
+    this.aboveSince = 0;
+    this.belowSince = 0;
+    this.retryTimer = null;
+    this.failures = 0;
+    this.label = "VOICE " + (frequency / 1000) + "kHz";
+    this.connect(0);
+  }
+
+  setActive(active) {
+    if (this.active === active) return;
+    this.active = active;
+    log(this.label, active ? "TALKING" : "quiet");
+    voiceBroadcast({ type: "voice", frequency: this.frequency, active });
+  }
+
+  onSignal(dbm) {
+    const now = Date.now();
+    if (this.baseline === null) {
+      this.warm.push(dbm);
+      if (this.warm.length >= 100) { // ~2 s of readings
+        const sorted = this.warm.slice().sort((a, b) => a - b);
+        this.baseline = sorted[Math.floor(sorted.length * 0.3)];
+        this.warm = [];
+      }
+      return;
+    }
+    const over = dbm - this.baseline;
+    // Background follows the quiet level; barely moves while someone talks.
+    this.baseline += (over < VOICE_OFF_DB ? 0.01 : 0.0005) * over;
+
+    if (over >= VOICE_ON_DB) {
+      if (!this.aboveSince) this.aboveSince = now;
+      this.belowSince = 0;
+      if (!this.active && now - this.aboveSince >= VOICE_ON_MS) this.setActive(true);
+    } else {
+      this.aboveSince = 0;
+      if (over < VOICE_OFF_DB) {
+        if (!this.belowSince) this.belowSince = now;
+        if (this.active && now - this.belowSince >= VOICE_OFF_MS) this.setActive(false);
+      }
+    }
+  }
+
+  async connect(index) {
+    if (this.stopped) return;
+    const list = voiceReceivers();
+    if (index >= list.length) {
+      this.failures++;
+      const wait = Math.min(60000, 5000 * this.failures);
+      log(this.label, "no receiver accepted, retrying in", wait / 1000, "s");
+      this.retryTimer = setTimeout(() => this.connect(0), wait);
+      return;
+    }
+    const receiver = list[index];
+    const sessionId = uuid();
+    try {
+      await registerSession(receiver, sessionId);
+    } catch (err) {
+      log(this.label, "receiver refused -", (receiver.callsign || receiver.url) + ":", err.message);
+      return this.connect(index + 1);
+    }
+    if (this.stopped) return;
+    let ws;
+    try {
+      ws = new WebSocket(audioUrl(receiver, sessionId, this.frequency, this.mode), {
+        handshakeTimeout: 15000,
+        perMessageDeflate: false,
+        headers: { "User-Agent": CLIENT }
+      });
+    } catch (err) {
+      return this.connect(index + 1);
+    }
+    this.ws = ws;
+    this.receiver = receiver;
+    ws.binaryType = "nodebuffer";
+    let opened = false;
+    ws.on("open", () => {
+      if (this.ws !== ws || this.stopped) return;
+      opened = true;
+      this.online = true;
+      this.failures = 0;
+      log(this.label, "watching via", receiver.callsign || receiver.url);
+      voiceBroadcast(voiceSnapshot());
+    });
+    ws.on("message", (data, isBinary) => {
+      if (!isBinary || this.ws !== ws) return;
+      const packet = Buffer.isBuffer(data) ? data : Buffer.from(data);
+      if (packet.length <= 21) return;
+      let s;
+      try { s = packet.readFloatLE(13); } catch { return; }
+      if (Number.isFinite(s) && s > SIGNAL_UNAVAILABLE) this.onSignal(s);
+    });
+    ws.on("error", err => log(this.label, "error:", err.message));
+    ws.on("close", code => {
+      if (this.ws !== ws) return;
+      this.ws = null;
+      this.online = false;
+      this.setActive(false);
+      this.baseline = null;
+      if (this.stopped) return;
+      log(this.label, "receiver closed", code, "- reconnecting");
+      voiceBroadcast(voiceSnapshot());
+      this.retryTimer = setTimeout(() => this.connect(opened ? 0 : index + 1), opened ? 3000 : 500);
+    });
+  }
+
+  stop() {
+    this.stopped = true;
+    if (this.retryTimer) clearTimeout(this.retryTimer);
+    if (this.ws) { try { this.ws.close(); } catch {} this.ws = null; }
+    this.online = false;
+    log(this.label, "stopped");
+  }
+}
+
+function voiceWant(frequencies) {
+  if (voiceStopTimer) { clearTimeout(voiceStopTimer); voiceStopTimer = null; }
+  for (const f of frequencies) {
+    if (voiceMonitors.size >= VOICE_WATCH_MAX) break;
+    if (!voiceMonitors.has(f)) voiceMonitors.set(f, new VoiceMonitor(f));
+  }
+}
+
+function voiceMaybeStop() {
+  if (voiceWatchers.size > 0 || voiceStopTimer) return;
+  voiceStopTimer = setTimeout(() => {
+    voiceStopTimer = null;
+    if (voiceWatchers.size > 0) return;
+    for (const m of voiceMonitors.values()) m.stop();
+    voiceMonitors.clear();
+    log("VOICE WATCH: no pages watching, all monitors stopped");
+  }, VOICE_WATCH_LINGER_MS);
+}
+
+function attachVoiceWatcher(browser) {
+  voiceWatchers.add(browser);
+  log("VOICE WATCH: page connected -", voiceWatchers.size, "watching");
+  browser.on("message", data => {
+    let msg;
+    try { msg = JSON.parse(data.toString()); } catch { return; }
+    if (msg.type !== "watch" || !Array.isArray(msg.frequencies)) return;
+    const wanted = [...new Set(
+      msg.frequencies.map(Number)
+        .filter(f => Number.isFinite(f) && f > 0)
+        .map(f => Math.round(f))
+        .filter(voiceAllowed)
+    )].slice(0, VOICE_WATCH_MAX);
+    voiceWant(wanted);
+    try { browser.send(JSON.stringify(voiceSnapshot())); } catch {}
+  });
+  browser.on("close", () => {
+    voiceWatchers.delete(browser);
+    log("VOICE WATCH: page left -", voiceWatchers.size, "watching");
+    voiceMaybeStop();
+  });
+  browser.on("error", () => {});
+}
+
 function findChannel(frequency, mode, except) {
   for (const ch of channels) {
     if (ch !== except && !ch.closed && ch.frequency === frequency && ch.mode === mode) return ch;
@@ -730,7 +961,7 @@ app.get("/", (req, res) => {
   let listeners = 0;
   for (const ch of channels) listeners += ch.listeners.size;
   res.type("text/plain").send(
-`ACURA SDR BRIDGE v3.0
+`ACURA SDR BRIDGE v3.1
 STATUS: ONLINE
 
 ENDPOINTS:
@@ -738,8 +969,10 @@ ENDPOINTS:
 /test-audio  - fixed-frequency test WebSocket
 /test        - simple browser test page
 /status      - what is playing right now (JSON)
+/voice-watch - "talking now" alerts for oceanic voice frequencies
 
 NOW: ${listeners} listener(s) on ${channels.size} receiver session(s)
+VOICE WATCH: ${voiceWatchers.size} page(s), ${voiceMonitors.size} frequency monitor(s)
 
 RECEIVERS (tried in this order):
 ${RECEIVERS.map((r, i) => `${i + 1}. ${r.callsign || ""} ${r.location || ""}`.trim()).join("\n")}
@@ -752,7 +985,8 @@ ${(DEFAULT_FREQUENCY / 1e6).toFixed(3)} MHz ${DEFAULT_MODE.toUpperCase()}
 
 app.get("/status", (req, res) => {
   res.json({
-    version: "3.0",
+    version: "3.1",
+    voiceWatch: voiceSnapshot().frequencies,
     channels: [...channels].map(ch => ({
       id: ch.id,
       frequency: ch.frequency,
@@ -778,6 +1012,7 @@ app.get("/test", (req, res) => {
    ============================================================ */
 const sdrWss = new WebSocket.Server({ noServer: true, perMessageDeflate: false });
 const testWss = new WebSocket.Server({ noServer: true, perMessageDeflate: false });
+const voiceWss = new WebSocket.Server({ noServer: true, perMessageDeflate: false });
 
 server.on("upgrade", (req, socket, head) => {
   let path;
@@ -791,6 +1026,13 @@ server.on("upgrade", (req, socket, head) => {
   if (path === "/sdr") {
     sdrWss.handleUpgrade(req, socket, head, ws => {
       sdrWss.emit("connection", ws);
+    });
+    return;
+  }
+
+  if (path === "/voice-watch") {
+    voiceWss.handleUpgrade(req, socket, head, ws => {
+      voiceWss.emit("connection", ws);
     });
     return;
   }
@@ -911,13 +1153,17 @@ testWss.on("connection", browser => {
   attachBridge(browser, { label: "TEST", fixed: true });
 });
 
+voiceWss.on("connection", browser => {
+  attachVoiceWatcher(browser);
+});
+
 /* ============================================================
    START
    ============================================================ */
 server.listen(PORT, "0.0.0.0", () => {
   console.log("");
   console.log("==============================");
-  console.log("ACURA SDR BRIDGE  -  v3.0 (shared channels + backup receivers)");
+  console.log("ACURA SDR BRIDGE  -  v3.1 (shared channels + backup receivers + voice watch)");
   console.log("==============================");
   console.log("Default:", (DEFAULT_FREQUENCY / 1e6).toFixed(3), "MHz", DEFAULT_MODE.toUpperCase());
   console.log("Live endpoint: /sdr   Status: /status");
